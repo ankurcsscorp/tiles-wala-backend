@@ -72,3 +72,51 @@ export const createEnquiry = (req, res) => {
         });
     });
 };
+
+// PATCH: Update an enquiry's remark
+export const updateEnquiry = (req, res) => {
+    const { id } = req.params;
+    const { remark } = req.body;
+    const enquiryId = Number(id);
+
+    if (!/^\d+$/.test(id) || !Number.isSafeInteger(enquiryId) || enquiryId < 1) {
+        return res.status(400).json({
+            message: "A valid enquiry ID is required"
+        });
+    }
+
+    if (remark === undefined || (remark !== null && typeof remark !== "string")) {
+        return res.status(400).json({
+            message: "Remark must be a string or null"
+        });
+    }
+
+    const q = `
+        UPDATE enquiry
+        SET remark = $1,
+            created_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        RETURNING *
+    `;
+
+    connection.query(q, [remark, enquiryId], (err, data) => {
+        if (err) {
+            console.error("Error updating enquiry:", err.message);
+
+            return res.status(500).json({
+                message: "Failed to update enquiry"
+            });
+        }
+
+        if (data.rowCount === 0) {
+            return res.status(404).json({
+                message: "Enquiry not found"
+            });
+        }
+
+        return res.status(200).json({
+            message: "Enquiry updated successfully",
+            enquiry: data.rows[0]
+        });
+    });
+};
