@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 import enquiriesRouter from "./src/routes/enquries.js";
 import authRouter from "./src/routes/auth.js";
+import usersRouter from "./src/routes/users.js";
+import salesBonusRouter from "./src/routes/salesBonus.js";
 import { connection } from "./connection.js";
 import { assertAuthConfiguration } from "./src/controllers/auth.js";
 
@@ -21,6 +23,8 @@ app.use(express.json({ limit: "20kb" }));
 
 app.use("/api/tiles", enquiriesRouter);
 app.use("/api/tiles/auth", authRouter);
+app.use("/api/tiles/users", usersRouter);
+app.use("/api/tiles/sales-bonus", salesBonusRouter);
 
 app.use((err, req, res, next) => {
   console.error("Unhandled request error:", err.message);
@@ -49,11 +53,104 @@ const startServer = async () => {
       name VARCHAR(150) NOT NULL,
       mobile VARCHAR(20) NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
+      area_location VARCHAR(200),
       user_type VARCHAR(30) NOT NULL CHECK (
         user_type IN ('Admin', 'Salesperson', 'Tile Mistire', 'Plumber Mistiri')
       ),
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await connection.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS area_location VARCHAR(200)
+  `);
+
+  await connection.query(`
+    ALTER TABLE enquiry
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  `);
+
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS sales_bonus_product_config (
+      id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      product_name VARCHAR(200) NOT NULL UNIQUE,
+      default_cost_price NUMERIC(12,2) NOT NULL DEFAULT 0,
+      default_bonus_percentage NUMERIC(5,2) NOT NULL DEFAULT 0,
+      unit_label VARCHAR(40) NOT NULL DEFAULT 'Box',
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await connection.query(`
+    INSERT INTO sales_bonus_product_config (product_name, default_cost_price, default_bonus_percentage, unit_label)
+    SELECT seed.product_name, seed.default_cost_price, seed.default_bonus_percentage, seed.unit_label
+    FROM (VALUES
+      ('Antila 12x18 Wall Tiles', 210, 10, 'Box'),
+      ('Antila 12x12 Floor Tiles', 230, 10, 'Box'),
+      ('Coinn 2x2 Floor Tiles', 440, 10, 'Box'),
+      ('Alaska 2x4 Gloss Tiles', 570, 10, 'Box'),
+      ('Alaska 2x4 Carvin Tiles', 620, 10, 'Box'),
+      ('Alaska 2x4 High gloss Tiles', 895, 10, 'Box'),
+      ('Galaxy Black Granite', 160, 10, 'Box'),
+      ('R Black Granite', 95, 10, 'Box'),
+      ('P white Granite', 70, 10, 'Box'),
+      ('M Black Granite', 95, 10, 'Box'),
+      ('K Black Granite', 95, 10, 'Box'),
+      ('R Brown Granite', 95, 10, 'Box'),
+      ('Gem red Granite', 115, 10, 'Box')
+    ) AS seed(product_name, default_cost_price, default_bonus_percentage, unit_label)
+    WHERE NOT EXISTS (SELECT 1 FROM sales_bonus_product_config)
+    ON CONFLICT (product_name) DO NOTHING;
+  `);
+
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS sales_bonus_records (
+      id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+      selected_user_type VARCHAR(30) NOT NULL,
+      total_quantity NUMERIC(12,2) NOT NULL DEFAULT 0,
+      total_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
+      total_selling_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+      total_gross_profit NUMERIC(12,2) NOT NULL DEFAULT 0,
+      total_gross_bonus NUMERIC(12,2) NOT NULL DEFAULT 0,
+      final_user_bonus NUMERIC(12,2) NOT NULL DEFAULT 0,
+      total_amount_paid NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (total_amount_paid >= 0),
+      payment_method VARCHAR(10) CHECK (payment_method IN ('UPI', 'CASH')),
+      is_fully_paid BOOLEAN NOT NULL DEFAULT FALSE,
+      status VARCHAR(20) NOT NULL DEFAULT 'draft',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await connection.query(`
+    ALTER TABLE sales_bonus_records
+    ADD COLUMN IF NOT EXISTS total_amount_paid NUMERIC(12,2) NOT NULL DEFAULT 0
+      CHECK (total_amount_paid >= 0),
+    ADD COLUMN IF NOT EXISTS payment_method VARCHAR(10)
+      CHECK (payment_method IN ('UPI', 'CASH')),
+    ADD COLUMN IF NOT EXISTS is_fully_paid BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS sales_bonus_record_items (
+      id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      sales_bonus_record_id BIGINT NOT NULL REFERENCES sales_bonus_records(id) ON DELETE CASCADE,
+      product_name VARCHAR(200) NOT NULL,
+      cost_price NUMERIC(12,2) NOT NULL,
+      selling_price NUMERIC(12,2) NOT NULL,
+      quantity NUMERIC(12,2) NOT NULL,
+      total_cost NUMERIC(12,2) NOT NULL,
+      total_selling_amount NUMERIC(12,2) NOT NULL,
+      gross_profit NUMERIC(12,2) NOT NULL,
+      bonus_percentage NUMERIC(5,2) NOT NULL,
+      gross_bonus NUMERIC(12,2) NOT NULL,
+      user_bonus NUMERIC(12,2) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 

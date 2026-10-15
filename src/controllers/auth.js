@@ -15,6 +15,7 @@ export const JWT_AUDIENCE = "tiles-wala-frontend";
 const PASSWORD_MIN_LENGTH = 8;
 const PASSWORD_MAX_BYTES = 72;
 const BCRYPT_ROUNDS = 12;
+const MISTIRI_USER_TYPES = new Set(["Tile Mistire", "Plumber Mistiri"]);
 
 export const assertAuthConfiguration = () => {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
@@ -48,6 +49,7 @@ const toPublicUser = (row) => ({
   name: row.name,
   mobile: row.mobile,
   userType: row.user_type,
+  areaLocation: row.area_location ?? null,
   createdAt: row.created_at,
 });
 
@@ -80,9 +82,17 @@ const matchesAdminSignupKey = (providedKey, configuredKey) => {
 };
 
 export const signup = async (req, res) => {
-  const { name, mobile: rawMobile, password, userType: rawUserType } = req.body ?? {};
+  const {
+    name,
+    mobile: rawMobile,
+    password,
+    userType: rawUserType,
+    areaLocation: rawAreaLocation,
+  } = req.body ?? {};
   const mobile = normalizeMobile(rawMobile);
   const userType = normalizeUserType(rawUserType);
+  const areaLocation =
+    typeof rawAreaLocation === "string" ? rawAreaLocation.trim() : "";
 
   if (typeof name !== "string" || !name.trim() || name.trim().length > 150) {
     return res.status(400).json({
@@ -110,6 +120,21 @@ export const signup = async (req, res) => {
     return res.status(400).json({ message: "Select a valid user type" });
   }
 
+  if (
+    MISTIRI_USER_TYPES.has(userType) &&
+    (!areaLocation || areaLocation.length > 200)
+  ) {
+    return res.status(400).json({
+      message: "Area/Location is required and must be 200 characters or fewer",
+    });
+  }
+
+  if (areaLocation.length > 200) {
+    return res.status(400).json({
+      message: "Area/Location must be 200 characters or fewer",
+    });
+  }
+
   if (userType === "Admin") {
     if (!process.env.ADMIN_SIGNUP_KEY) {
       return res.status(503).json({
@@ -124,10 +149,16 @@ export const signup = async (req, res) => {
   try {
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const result = await connection.query(
-      `INSERT INTO users (name, mobile, password_hash, user_type)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, name, mobile, user_type, created_at`,
-      [name.trim(), mobile, passwordHash, userType]
+      `INSERT INTO users (name, mobile, password_hash, user_type, area_location)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, mobile, user_type, area_location, created_at`,
+      [
+        name.trim(),
+        mobile,
+        passwordHash,
+        userType,
+        MISTIRI_USER_TYPES.has(userType) ? areaLocation : null,
+      ]
     );
 
     return sendAuthenticatedResponse(res, result.rows[0], 201);
@@ -165,7 +196,7 @@ export const login = async (req, res) => {
 
   try {
     const result = await connection.query(
-      `SELECT id, name, mobile, user_type, password_hash, created_at
+      `SELECT id, name, mobile, user_type, area_location, password_hash, created_at
        FROM users
        WHERE mobile = $1`,
       [mobile]
