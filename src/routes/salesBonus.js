@@ -5,6 +5,7 @@ import {
 	getManageableProductCatalog,
 	getProductCatalog,
 	getSalesBonusRecords,
+	getTopSeller,
 	updateSalesBonusPayment,
 	updateProductConfig,
 } from "../controllers/salesBonus.js";
@@ -17,6 +18,7 @@ router.post("/products", requireAuth, requireUserTypes("Admin"), createProductCo
 router.put("/products/:id", requireAuth, requireUserTypes("Admin"), updateProductConfig);
 router.get("/products", requireAuth, requireUserTypes("Admin"), getProductCatalog);
 router.get("/records", requireAuth, getSalesBonusRecords);
+router.get("/top-seller", requireAuth, getTopSeller);
 router.patch("/records/:id/payment", requireAuth, requireUserTypes("Admin"), updateSalesBonusPayment);
 router.post("/records", requireAuth, requireUserTypes("Admin"), createSalesBonusRecord);
 

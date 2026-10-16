@@ -6,6 +6,7 @@ import {
   createSalesBonusRecord,
   getManageableProductCatalog,
   getSalesBonusRecords,
+  getTopSeller,
   updateSalesBonusPayment,
   updateProductConfig,
 } from "./salesBonus.js";
@@ -208,6 +209,82 @@ test("prevents non-admin users from requesting another user's sales bonus record
     { user: { id: 12, userType: "Salesperson" }, query: { userId: "34" } },
     response
   );
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("returns the top three sellers within the authenticated user's role", async () => {
+  const topSellers = [
+    { id: "28", name: "Top Mason", userType: "Tile Mistire", total_sales: "12500.00" },
+    { id: "29", name: "Second Mason", userType: "Tile Mistire", total_sales: "10000.00" },
+    { id: "30", name: "Third Mason", userType: "Tile Mistire", total_sales: "7500.00" },
+  ];
+  connection.query = async (query, values) => {
+    assert.match(query, /WHERE u\.user_type = \$1/);
+    assert.match(query, /SUM\(s\.total_selling_amount\) DESC/);
+    assert.match(query, /LIMIT 3/);
+    assert.deepEqual(values, ["Tile Mistire"]);
+    return { rows: topSellers };
+  };
+  const response = createResponse();
+
+  await getTopSeller({ user: { id: 12, userType: "Tile Mistire" } }, response);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body, { topSellers });
+});
+
+test("allows admins to request the top three sellers for the selected role", async () => {
+  const topSellers = [{ id: "28", name: "Top Salesperson", total_sales: "12500.00" }];
+  connection.query = async (_query, values) => {
+    assert.deepEqual(values, ["Salesperson"]);
+    return { rows: topSellers };
+  };
+  const response = createResponse();
+
+  await getTopSeller(
+    { user: { id: 1, userType: "Admin" }, query: { userType: "Salesperson" } },
+    response
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body, { topSellers });
+});
+
+test("rejects admins requesting an unsupported top-seller role", async () => {
+  connection.query = async () => {
+    throw new Error("Database should not be queried for unsupported roles");
+  };
+  const response = createResponse();
+
+  await getTopSeller(
+    { user: { id: 1, userType: "Admin" }, query: { userType: "Plumber Mistiri" } },
+    response
+  );
+
+  assert.equal(response.statusCode, 400);
+});
+
+test("returns no top seller when the role has no sales yet", async () => {
+  connection.query = async (_query, values) => {
+    assert.deepEqual(values, ["Salesperson"]);
+    return { rows: [] };
+  };
+  const response = createResponse();
+
+  await getTopSeller({ user: { id: 12, userType: "Salesperson" } }, response);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body, { topSellers: [] });
+});
+
+test("prevents unsupported roles from requesting the top seller", async () => {
+  connection.query = async () => {
+    throw new Error("Database should not be queried for unsupported roles");
+  };
+  const response = createResponse();
+
+  await getTopSeller({ user: { id: 12, userType: "Plumber Mistiri" } }, response);
 
   assert.equal(response.statusCode, 403);
 });

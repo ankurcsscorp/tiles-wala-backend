@@ -157,6 +157,42 @@ export const getSalesBonusRecords = async (req, res) => {
   }
 };
 
+export const getTopSeller = async (req, res) => {
+  const isAdmin = req.user?.userType?.toLowerCase() === "admin";
+  const userType = isAdmin ? req.query?.userType : req.user?.userType;
+  const sellerType = {
+    salesperson: "Salesperson",
+    "tile mistire": "Tile Mistire",
+  }[userType?.toLowerCase()];
+  if (!sellerType) {
+    const status = isAdmin ? 400 : 403;
+    return res.status(status).json({
+      message: isAdmin
+        ? "Select a valid salesperson or tile mason group."
+        : "You do not have permission to view the top seller.",
+    });
+  }
+
+  try {
+    const result = await connection.query(
+      `SELECT u.id, u.name, u.user_type AS "userType",
+              SUM(s.total_selling_amount) AS total_sales
+       FROM users u
+       JOIN sales_bonus_records s ON s.user_id = u.id
+       WHERE u.user_type = $1
+       GROUP BY u.id, u.name, u.user_type
+       ORDER BY SUM(s.total_selling_amount) DESC, u.id ASC
+       LIMIT 3;`,
+      [sellerType]
+    );
+
+    return res.status(200).json({ topSellers: result.rows });
+  } catch (error) {
+    console.error("Error fetching top sales bonus seller:", error.message);
+    return res.status(500).json({ message: "Unable to load top seller." });
+  }
+};
+
 export const updateSalesBonusPayment = async (req, res) => {
   const recordId = Number(req.params.id);
   const amountInput =
