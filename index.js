@@ -5,6 +5,7 @@ import enquiriesRouter from "./src/routes/enquries.js";
 import authRouter from "./src/routes/auth.js";
 import usersRouter from "./src/routes/users.js";
 import salesBonusRouter from "./src/routes/salesBonus.js";
+import collectionsRouter from "./src/routes/collections.js";
 import { connection } from "./connection.js";
 import { assertAuthConfiguration } from "./src/controllers/auth.js";
 
@@ -19,6 +20,11 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
+app.use(
+  "/api/tiles/collections",
+  express.json({ limit: "12mb" }),
+  collectionsRouter
+);
 app.use(express.json({ limit: "20kb" }));
 
 app.use("/api/tiles", enquiriesRouter);
@@ -29,6 +35,9 @@ app.use("/api/tiles/sales-bonus", salesBonusRouter);
 app.use((err, req, res, next) => {
   console.error("Unhandled request error:", err.message);
   if (res.headersSent) return next(err);
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({ message: "Request body exceeds the allowed size." });
+  }
   return res.status(500).json({ message: "An unexpected server error occurred" });
 });
 
@@ -65,6 +74,34 @@ const startServer = async () => {
   await connection.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS area_location VARCHAR(200)
+  `);
+
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS tile_collections (
+      id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      featured_key VARCHAR(20),
+      name VARCHAR(150) NOT NULL,
+      size VARCHAR(80) NOT NULL,
+      description VARCHAR(1000) NOT NULL,
+      images JSONB NOT NULL CHECK (jsonb_typeof(images) = 'array'),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await connection.query(`
+    ALTER TABLE tile_collections
+    ADD COLUMN IF NOT EXISTS featured_key VARCHAR(20)
+  `);
+  await connection.query(`
+    DELETE FROM tile_collections older
+    USING tile_collections newer
+    WHERE older.featured_key IS NOT NULL
+      AND older.featured_key = newer.featured_key
+      AND (older.created_at, older.id) < (newer.created_at, newer.id)
+  `);
+  await connection.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS tile_collections_featured_key_unique
+    ON tile_collections (featured_key)
+    WHERE featured_key IS NOT NULL
   `);
 
   await connection.query(`
