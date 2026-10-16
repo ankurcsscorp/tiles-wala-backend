@@ -79,6 +79,164 @@ export const getManageableProductCatalog = async (_req, res) => {
   }
 };
 
+export const getSalesBonusRecords = async (req, res) => {
+  const isAdmin = req.user?.userType?.toLowerCase() === "admin";
+  const requestedUserId = req.query.userId;
+
+  if (requestedUserId !== undefined && !isAdmin) {
+    return res.status(403).json({ message: "You do not have permission to view these records." });
+  }
+
+  const userId = isAdmin && requestedUserId !== undefined
+    ? Number(requestedUserId)
+    : Number(req.user?.id);
+  if (!Number.isSafeInteger(userId) || userId <= 0) {
+    return res.status(400).json({ message: "A valid user ID is required." });
+  }
+
+  try {
+    const userResult = await connection.query(
+      `SELECT id, name, mobile, user_type
+       FROM users
+       WHERE id = $1;`,
+      [userId]
+    );
+    const selectedUser = userResult.rows[0];
+    if (!selectedUser) {
+      return res.status(404).json({ message: "User was not found." });
+    }
+
+    const recordsResult = await connection.query(
+      `SELECT id, user_id, selected_user_type, total_quantity, total_cost,
+              total_selling_amount, total_gross_profit, total_gross_bonus,
+              final_user_bonus, total_amount_paid, payment_method,
+              is_fully_paid, status, created_at
+       FROM sales_bonus_records
+       WHERE user_id = $1
+       ORDER BY created_at DESC, id DESC;`,
+      [userId]
+    );
+    const records = recordsResult.rows;
+    const recordIds = records.map((record) => record.id);
+    let items = [];
+    if (recordIds.length) {
+      const itemsResult = await connection.query(
+        `SELECT id, sales_bonus_record_id, product_name, cost_price,
+                selling_price, quantity, total_cost, total_selling_amount,
+                gross_profit, bonus_percentage, gross_bonus, user_bonus
+         FROM sales_bonus_record_items
+         WHERE sales_bonus_record_id = ANY($1::bigint[])
+         ORDER BY id ASC;`,
+        [recordIds]
+      );
+      items = itemsResult.rows;
+    }
+
+    const itemsByRecord = new Map();
+    for (const item of items) {
+      const recordItems = itemsByRecord.get(item.sales_bonus_record_id) ?? [];
+      recordItems.push(item);
+      itemsByRecord.set(item.sales_bonus_record_id, recordItems);
+    }
+
+    return res.status(200).json({
+      user: {
+        id: selectedUser.id,
+        name: selectedUser.name,
+        mobile: selectedUser.mobile,
+        userType: selectedUser.user_type,
+      },
+      records: records.map((record) => ({
+        ...record,
+        items: itemsByRecord.get(record.id) ?? [],
+      })),
+    });
+  } catch (error) {
+    console.error("Error fetching sales bonus records:", error.message);
+    return res.status(500).json({ message: "Unable to load sales bonus records." });
+  }
+};
+
+export const updateSalesBonusPayment = async (req, res) => {
+  const recordId = Number(req.params.id);
+  const amountInput =
+    typeof req.body?.amount === "string" && req.body.amount.trim() === ""
+      ? Number.NaN
+      : Number(req.body?.amount);
+  const paymentMethod = req.body?.paymentMethod;
+
+  if (!Number.isSafeInteger(recordId) || recordId <= 0) {
+    return res.status(400).json({ message: "A valid sales bonus record ID is required." });
+  }
+  if (!Number.isFinite(amountInput) || amountInput <= 0) {
+    return res.status(400).json({ message: "Payment amount must be greater than zero." });
+  }
+  if (!["UPI", "CASH"].includes(paymentMethod)) {
+    return res.status(400).json({ message: "Payment method must be UPI or CASH." });
+  }
+
+  const paymentAmount = Math.round(amountInput * 100) / 100;
+  if (paymentAmount <= 0) {
+    return res.status(400).json({ message: "Payment amount must be at least 0.01." });
+  }
+
+  const client = await connection.connect();
+  try {
+    await client.query("BEGIN");
+    const recordResult = await client.query(
+      `SELECT id, final_user_bonus, total_amount_paid
+       FROM sales_bonus_records
+       WHERE id = $1
+       FOR UPDATE;`,
+      [recordId]
+    );
+    const record = recordResult.rows[0];
+    if (!record) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Sales bonus record was not found." });
+    }
+
+    const finalBonus = Number(record.final_user_bonus);
+    const alreadyPaid = Number(record.total_amount_paid);
+    const dueAmount = Math.max(finalBonus - alreadyPaid, 0);
+    if (paymentAmount > dueAmount) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        message: "Payment amount cannot exceed the remaining bonus due.",
+      });
+    }
+
+    const totalAmountPaid = Math.round((alreadyPaid + paymentAmount) * 100) / 100;
+    const isFullyPaid = totalAmountPaid >= finalBonus;
+    const updateResult = await client.query(
+      `UPDATE sales_bonus_records
+       SET total_amount_paid = $1,
+           payment_method = $2,
+           is_fully_paid = $3,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4
+       RETURNING id, total_amount_paid, payment_method, is_fully_paid, updated_at;`,
+      [totalAmountPaid, paymentMethod, isFullyPaid, recordId]
+    );
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      message: "Sales bonus payment updated successfully.",
+      record: updateResult.rows[0],
+    });
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Error rolling back sales bonus payment:", rollbackError.message);
+    }
+    console.error("Error updating sales bonus payment:", error.message);
+    return res.status(500).json({ message: "Unable to update sales bonus payment." });
+  } finally {
+    client.release();
+  }
+};
+
 export const createProductConfig = async (req, res) => {
   const validation = validateProductPayload(req.body);
   if (validation.error) {

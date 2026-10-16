@@ -5,6 +5,8 @@ import {
   createProductConfig,
   createSalesBonusRecord,
   getManageableProductCatalog,
+  getSalesBonusRecords,
+  updateSalesBonusPayment,
   updateProductConfig,
 } from "./salesBonus.js";
 
@@ -137,6 +139,142 @@ test("creates a record using configured cost and calculates the salesperson allo
   assert.equal(insertedItemValues[10], 3);
   assert.equal(response.body.record.selectedUser.id, 12);
   assert.equal(transactionCommands.at(-1), "COMMIT");
+});
+
+test("returns the authenticated user's sales bonus records with item details", async () => {
+  const record = {
+    id: "55",
+    user_id: "12",
+    final_user_bonus: "12.00",
+    total_amount_paid: "5.00",
+    created_at: "2026-10-15T10:00:00.000Z",
+  };
+  const item = {
+    id: "91",
+    sales_bonus_record_id: "55",
+    product_name: "Configured Tile",
+    user_bonus: "12.00",
+  };
+  connection.query = async (query, values) => {
+    if (query.includes("FROM users")) return { rows: [selectedUser] };
+    if (query.includes("FROM sales_bonus_records")) return { rows: [record] };
+    if (query.includes("FROM sales_bonus_record_items")) {
+      assert.deepEqual(values, [["55"]]);
+      return { rows: [item] };
+    }
+    throw new Error(`Unexpected query: ${query}`);
+  };
+  const response = createResponse();
+
+  await getSalesBonusRecords(
+    { user: { id: 12, userType: "Salesperson" }, query: {} },
+    response
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body.user, {
+    id: 12,
+    name: "Tile Partner",
+    mobile: "9876543210",
+    userType: "Salesperson",
+  });
+  assert.deepEqual(response.body.records, [{ ...record, items: [item] }]);
+});
+
+test("allows admins to select a user's sales bonus records", async () => {
+  const queriedUserIds = [];
+  connection.query = async (query, values) => {
+    queriedUserIds.push(values?.[0]);
+    if (query.includes("FROM users")) return { rows: [selectedUser] };
+    if (query.includes("FROM sales_bonus_records")) return { rows: [] };
+    throw new Error(`Unexpected query: ${query}`);
+  };
+  const response = createResponse();
+
+  await getSalesBonusRecords(
+    { user: { id: 1, userType: "Admin" }, query: { userId: "12" } },
+    response
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(queriedUserIds, [12, 12]);
+  assert.deepEqual(response.body.records, []);
+});
+
+test("prevents non-admin users from requesting another user's sales bonus records", async () => {
+  const response = createResponse();
+
+  await getSalesBonusRecords(
+    { user: { id: 12, userType: "Salesperson" }, query: { userId: "34" } },
+    response
+  );
+
+  assert.equal(response.statusCode, 403);
+});
+
+test("records an admin payment against the remaining bonus balance", async () => {
+  const commands = [];
+  let updatedValues;
+  connection.connect = async () => ({
+    query: async (query, values) => {
+      commands.push(query.trim());
+      if (query.includes("SELECT id, final_user_bonus")) {
+        return {
+          rows: [{ id: 55, final_user_bonus: "12.00", total_amount_paid: "5.00" }],
+        };
+      }
+      if (query.includes("UPDATE sales_bonus_records")) {
+        updatedValues = values;
+        return {
+          rows: [{
+            id: 55,
+            total_amount_paid: values[0],
+            payment_method: values[1],
+            is_fully_paid: values[2],
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  });
+  const response = createResponse();
+
+  await updateSalesBonusPayment(
+    { params: { id: "55" }, body: { amount: 7, paymentMethod: "UPI" } },
+    response
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(updatedValues, [12, "UPI", true, 55]);
+  assert.equal(response.body.record.is_fully_paid, true);
+  assert.equal(commands[0], "BEGIN");
+  assert.equal(commands.at(-1), "COMMIT");
+});
+
+test("rejects a payment larger than the outstanding bonus balance", async () => {
+  const commands = [];
+  connection.connect = async () => ({
+    query: async (query) => {
+      commands.push(query.trim());
+      if (query.includes("SELECT id, final_user_bonus")) {
+        return {
+          rows: [{ id: 55, final_user_bonus: "12.00", total_amount_paid: "5.00" }],
+        };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  });
+  const response = createResponse();
+
+  await updateSalesBonusPayment(
+    { params: { id: "55" }, body: { amount: 7.01, paymentMethod: "CASH" } },
+    response
+  );
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(commands.at(-1), "ROLLBACK");
 });
 
 test("marks a record fully paid using the calculated final payable", async () => {
