@@ -94,7 +94,7 @@ export const updateEnquiry = (req, res) => {
     const q = `
         UPDATE enquiry
         SET remark = $1,
-            created_at = CURRENT_TIMESTAMP
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = $2
         RETURNING *
     `;
