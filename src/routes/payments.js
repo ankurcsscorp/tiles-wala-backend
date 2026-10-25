@@ -1,0 +1,20 @@
+import express from "express";
+import { requireAuth,requireUserTypes } from "../middleware/auth.js";
+import { allocatePayment,createCustomerReceipt,createSupplierPayment,dailyCollections,eligibleInvoices,getPayment,invoicePaymentHistory,listPaymentMethods,listPayments,partyPaymentHistory,reversePayment,savePaymentMethod,setPaymentMethodStatus } from "../controllers/payments.js";
+
+const router=express.Router();
+router.use(requireAuth,requireUserTypes("Admin","Salesperson"));
+router.get("/methods",listPaymentMethods);
+router.post("/methods",requireUserTypes("Admin"),savePaymentMethod);
+router.patch("/methods/:code/status",requireUserTypes("Admin"),setPaymentMethodStatus);
+router.get("/daily-collections",dailyCollections);
+router.get("/eligible-invoices",eligibleInvoices);
+router.get("/invoices/:invoiceType/:invoiceId/history",invoicePaymentHistory);
+router.get("/parties/:partyType/:partyId/history",partyPaymentHistory);
+router.post("/customer-receipts",createCustomerReceipt);
+router.post("/supplier-payments",createSupplierPayment);
+router.get("/",listPayments);
+router.get("/:id",getPayment);
+router.post("/:id/allocations",allocatePayment);
+router.post("/:id/reverse",reversePayment);
+export default router;

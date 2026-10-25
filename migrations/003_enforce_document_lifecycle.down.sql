@@ -1,0 +1,18 @@
+DROP TRIGGER IF EXISTS transfer_item_draft_only ON stock_transfer_items;
+DROP TRIGGER IF EXISTS purchase_return_item_draft_only ON purchase_return_items;
+DROP TRIGGER IF EXISTS sales_return_item_draft_only ON sales_return_items;
+DROP TRIGGER IF EXISTS purchase_invoice_item_draft_only ON purchase_invoice_items;
+DROP TRIGGER IF EXISTS sales_invoice_item_draft_only ON sales_invoice_items;
+DROP FUNCTION IF EXISTS guard_billing_document_item_write();
+DROP TRIGGER IF EXISTS transfer_insert_draft ON stock_transfers;
+DROP TRIGGER IF EXISTS purchase_return_insert_draft ON purchase_returns;
+DROP TRIGGER IF EXISTS sales_return_insert_draft ON sales_returns;
+DROP TRIGGER IF EXISTS purchase_invoice_insert_draft ON purchase_invoices;
+DROP TRIGGER IF EXISTS sales_invoice_insert_draft ON sales_invoices;
+DROP FUNCTION IF EXISTS guard_billing_document_insert();
+DROP TRIGGER IF EXISTS transfer_lifecycle ON stock_transfers;
+DROP TRIGGER IF EXISTS purchase_return_lifecycle ON purchase_returns;
+DROP TRIGGER IF EXISTS sales_return_lifecycle ON sales_returns;
+DROP TRIGGER IF EXISTS purchase_invoice_lifecycle ON purchase_invoices;
+DROP TRIGGER IF EXISTS sales_invoice_lifecycle ON sales_invoices;
+DROP FUNCTION IF EXISTS guard_billing_document_update();

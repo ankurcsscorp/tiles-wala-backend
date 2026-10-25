@@ -1,0 +1,16 @@
+DROP TRIGGER IF EXISTS conversion_unit_check ON product_unit_conversions;
+DROP TRIGGER IF EXISTS product_unit_conversion_check ON products;
+DROP FUNCTION IF EXISTS validate_product_units();
+DROP TABLE IF EXISTS product_unit_conversions;
+DROP INDEX IF EXISTS products_category_active_idx;
+DROP INDEX IF EXISTS products_brand_prefix_idx;
+DROP INDEX IF EXISTS products_collection_prefix_idx;
+DROP INDEX IF EXISTS products_size_prefix_idx;
+DROP INDEX IF EXISTS products_finish_prefix_idx;
+DROP INDEX IF EXISTS products_sku_prefix_idx;
+DROP INDEX IF EXISTS products_name_prefix_idx;
+DROP INDEX IF EXISTS products_color_prefix_idx;
+DROP INDEX IF EXISTS product_category_name_prefix_idx;
+ALTER TABLE products DROP COLUMN IF EXISTS category_id, DROP COLUMN IF EXISTS brand, DROP COLUMN IF EXISTS collection, DROP COLUMN IF EXISTS tile_size, DROP COLUMN IF EXISTS finish, DROP COLUMN IF EXISTS color, DROP COLUMN IF EXISTS product_description, DROP COLUMN IF EXISTS product_image_url, DROP COLUMN IF EXISTS hsn_code, DROP COLUMN IF EXISTS tax_rate, DROP COLUMN IF EXISTS tax_inclusive, DROP COLUMN IF EXISTS purchase_unit_id, DROP COLUMN IF EXISTS sales_unit_id, DROP COLUMN IF EXISTS default_purchase_price, DROP COLUMN IF EXISTS default_selling_price, DROP COLUMN IF EXISTS reorder_threshold;
+ALTER TABLE units_of_measure DROP COLUMN IF EXISTS is_active, DROP COLUMN IF EXISTS updated_at;
+DROP TABLE IF EXISTS product_categories;

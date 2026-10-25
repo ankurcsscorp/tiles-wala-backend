@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS products_sku_case_insensitive_unique;

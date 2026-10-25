@@ -6,8 +6,22 @@ import authRouter from "./src/routes/auth.js";
 import usersRouter from "./src/routes/users.js";
 import salesBonusRouter from "./src/routes/salesBonus.js";
 import collectionsRouter from "./src/routes/collections.js";
+import storesRouter from "./src/routes/stores.js";
+import productsRouter from "./src/routes/products.js";
+import customersRouter from "./src/routes/customers.js";
+import suppliersRouter from "./src/routes/suppliers.js";
+import inventoryRouter from "./src/routes/inventory.js";
+import purchasesRouter from "./src/routes/purchases.js";
+import salesRouter from "./src/routes/sales.js";
+import paymentsRouter from "./src/routes/payments.js";
+import transfersRouter from "./src/routes/transfers.js";
+import returnsRouter from "./src/routes/returns.js";
+import financialReportsRouter from "./src/routes/financialReports.js";
+import dashboardRouter from "./src/routes/dashboard.js";
 import { connection } from "./connection.js";
 import { assertAuthConfiguration } from "./src/controllers/auth.js";
+
+import gstRouter from "./src/routes/gst.js";
 
 const app = express();
 
@@ -31,6 +45,19 @@ app.use("/api/tiles", enquiriesRouter);
 app.use("/api/tiles/auth", authRouter);
 app.use("/api/tiles/users", usersRouter);
 app.use("/api/tiles/sales-bonus", salesBonusRouter);
+app.use("/api/tiles/stores", storesRouter);
+app.use("/api/tiles/products", productsRouter);
+app.use("/api/gst", gstRouter);
+app.use("/api/tiles/customers", customersRouter);
+app.use("/api/tiles/suppliers", suppliersRouter);
+app.use("/api/tiles/inventory", inventoryRouter);
+app.use("/api/tiles/purchases", purchasesRouter);
+app.use("/api/tiles/sales", salesRouter);
+app.use("/api/tiles/payments", paymentsRouter);
+app.use("/api/tiles/transfers", transfersRouter);
+app.use("/api/tiles/returns", returnsRouter);
+app.use("/api/tiles/financial-reports", financialReportsRouter);
+app.use("/api/tiles/dashboard", dashboardRouter);
 
 app.use((err, req, res, next) => {
   console.error("Unhandled request error:", err.message);

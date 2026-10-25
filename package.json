@@ -14,7 +14,10 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "migrate": "node scripts/migrate.js",
+    "migrate:down": "node scripts/rollback-migration.js",
+    "test:db": "node --test src/database.integrity.test.js"
   },
   "keywords": [],
   "author": "",

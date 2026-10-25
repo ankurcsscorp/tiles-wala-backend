@@ -34,3 +34,9 @@ User types accepted at signup: `Admin`, `Salesperson`, `Tile Mistire`, and
 `Plumber Mistiri`.
 
 Run backend unit tests with `npm test`.
+
+## Database migrations
+
+The current application continues to initialize its existing tables at startup. New billing and inventory schema is managed by ordered PostgreSQL migrations in `migrations/`. Initialize the existing application schema first by starting the backend against the configured development database, then apply new migrations with `npm run migrate`. Review `migrations/README.md` for backup and rollback instructions. `npm run test:db` runs transactional integrity checks after migration 001 is applied; it skips when database credentials are not configured.
+
+GSTIN lookup setup, provider onboarding, migrations 019/020, API examples and validation details: [GST lookup guide](docs/GST_LOOKUP.md).

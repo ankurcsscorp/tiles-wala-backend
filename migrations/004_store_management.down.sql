@@ -1,0 +1,4 @@
+ALTER TABLE purchase_invoices DROP COLUMN IF EXISTS store_email_snapshot, DROP COLUMN IF EXISTS store_phone_snapshot, DROP COLUMN IF EXISTS store_tax_id_snapshot, DROP COLUMN IF EXISTS store_address_snapshot, DROP COLUMN IF EXISTS store_name_snapshot;
+ALTER TABLE sales_invoices DROP COLUMN IF EXISTS store_email_snapshot, DROP COLUMN IF EXISTS store_phone_snapshot, DROP COLUMN IF EXISTS store_tax_id_snapshot, DROP COLUMN IF EXISTS store_address_snapshot, DROP COLUMN IF EXISTS store_name_snapshot;
+ALTER TABLE store_billing_config DROP COLUMN IF EXISTS terms_and_conditions;
+ALTER TABLE stores DROP COLUMN IF EXISTS invoice_number_padding, DROP COLUMN IF EXISTS invoice_numbering_period, DROP COLUMN IF EXISTS terms_and_conditions, DROP COLUMN IF EXISTS invoice_footer, DROP COLUMN IF EXISTS gstin, DROP COLUMN IF EXISTS logo_url, DROP COLUMN IF EXISTS pin_code, DROP COLUMN IF EXISTS state, DROP COLUMN IF EXISTS city;

@@ -1,0 +1,18 @@
+DROP TRIGGER IF EXISTS stock_adjustment_stock_post ON stock_adjustments;
+DROP TRIGGER IF EXISTS stock_transfer_stock_post ON stock_transfers;
+DROP TRIGGER IF EXISTS purchase_return_stock_post ON purchase_returns;
+DROP TRIGGER IF EXISTS sales_return_stock_post ON sales_returns;
+DROP TRIGGER IF EXISTS sales_invoice_stock_post ON sales_invoices;
+DROP TRIGGER IF EXISTS purchase_invoice_stock_post ON purchase_invoices;
+DROP FUNCTION IF EXISTS post_stock_document();
+DROP FUNCTION IF EXISTS product_quantity_in_base(BIGINT, BIGINT, NUMERIC);
+DROP TRIGGER IF EXISTS stock_adjustment_item_draft_only ON stock_adjustment_items;
+DROP FUNCTION IF EXISTS guard_stock_adjustment_item_write();
+DROP TRIGGER IF EXISTS stock_adjustment_no_delete ON stock_adjustments;
+DROP TRIGGER IF EXISTS stock_adjustment_lifecycle ON stock_adjustments;
+DROP TRIGGER IF EXISTS stock_adjustment_insert_draft ON stock_adjustments;
+DROP FUNCTION IF EXISTS guard_stock_adjustment_insert();
+DROP TABLE IF EXISTS stock_adjustment_items;
+DROP TABLE IF EXISTS stock_adjustments;
+DROP INDEX IF EXISTS inventory_balances_product_idx;
+DROP INDEX IF EXISTS stock_movements_created_at_idx;
