@@ -1,140 +1,166 @@
-import { connection } from "../../connection.js";
-import { canAccessStore, canManageStore } from "./stores.js";
-
-const admin = (req) => req.user?.userType?.toLowerCase() === "admin";
-const validId = (x) => /^\d+$/.test(String(x ?? ""));
-const validQty = (x) => /^\d{1,14}(\.\d{1,4})?$/.test(String(x ?? "")) && /[1-9]/.test(String(x ?? ""));
-const validMoney = (x) => /^\d{1,14}(\.\d{1,2})?$/.test(String(x ?? ""));
-const dateOk = (x) => /^\d{4}-\d{2}-\d{2}$/.test(String(x ?? ""));
-const replyError = (res,e,label) => {
-  if (e.status) return res.status(e.status).json({ message: e.message });
-  if (["23503","23514","22007","22003","22P02"].includes(e.code)) return res.status(400).json({ message: e.message });
-  if (e.code === "23505") return res.status(409).json({ message: "Duplicate return number or request" });
-  console.error(label,e.message); return res.status(500).json({ message: label });
-};
-
-async function getReturn(kind,id) {
-  const sales=kind==="sales";
-  const table=sales?"sales_returns":"purchase_returns", invoice=sales?"sales_invoices":"purchase_invoices";
-  const party=sales?"customers":"suppliers", fk=sales?"customer_id":"supplier_id";
-  const h=await connection.query(`SELECT r.*,i.${fk} AS party_id,i.invoice_number AS original_invoice_number,COALESCE(p.name,${sales?"'Walk-in customer'":"'Supplier'"}) AS party_name,s.name AS store_name,s.code AS store_code,
-    a.name AS approved_by_name,c.name AS created_by_name FROM ${table} r JOIN ${invoice} i ON i.id=r.${sales?"sales_invoice_id":"purchase_invoice_id"}
-    LEFT JOIN ${party} p ON p.id=i.${fk} JOIN stores s ON s.id=r.store_id LEFT JOIN users a ON a.id=${sales?"r.approved_by":"NULL::bigint"} LEFT JOIN users c ON c.id=r.created_by WHERE r.id=$1`,[id]);
-  if(!h.rowCount)return null;
-  const items=sales
-    ? await connection.query(`SELECT ri.*,si.line_number,si.product_sku_snapshot AS sku,si.product_name_snapshot AS product_name,si.unit_id,si.unit_code_snapshot AS unit_code,si.unit_name_snapshot AS unit_name,si.quantity AS original_quantity,
-      COALESCE((SELECT sum(x.quantity) FROM sales_return_items x JOIN sales_returns xr ON xr.id=x.sales_return_id WHERE x.sales_invoice_item_id=ri.sales_invoice_item_id AND xr.status='posted'),0) AS previously_returned_quantity
-      FROM sales_return_items ri JOIN sales_invoice_items si ON si.id=ri.sales_invoice_item_id WHERE ri.sales_return_id=$1 ORDER BY ri.id`,[id])
-    : await connection.query(`SELECT ri.*,pi.line_number,pi.product_sku_snapshot AS sku,pi.product_name_snapshot AS product_name,pi.unit_id,pi.unit_code_snapshot AS unit_code,pi.unit_name_snapshot AS unit_name,pi.quantity AS original_quantity
-      FROM purchase_return_items ri JOIN purchase_invoice_items pi ON pi.id=ri.purchase_invoice_item_id WHERE ri.purchase_return_id=$1 ORDER BY ri.id`,[id]);
-  return {...h.rows[0],items:items.rows};
+import {businessCustomerEntries,businessSupplierEntries} from './financialReports.js';
+import {connection} from '../../connection.js';
+import {canAccessStore,canManageStore} from './stores.js';
+import {hasPermission} from '../services/permissions.js';
+import * as workflow from '../services/returnInvoices.js';
+import {adjustInvoiceBonusForReturn} from './salesBonusIntegration.js';
+const {spec,fail,idOk,validDate,authorize,sourceInvoice,sourceItems,calculate,partyBalance,invoiceBalances,permissions}=workflow;
+const error=(res,e,label)=>{if(e.status)return res.status(e.status).json({message:e.message});if(['23503','23514','22007','22003','22P02','TW001'].includes(e.code))return res.status(422).json({message:e.message});if(e.code==='23505')return res.status(409).json({message:'Duplicate return or settlement request'});console.error(label,e.message);return res.status(500).json({message:label});};
+const kindOf=req=>req.params.type||req.query.type||'sales';
+async function audit(db,user,s,id,storeId,action,data){await db.query('INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,after_data) VALUES($1,$2,$3,$4,$5,$6)',[storeId,user.id,`${s.kind}_return.${action}`,`${s.kind}_return`,id,data]);}
+async function transaction(req,res,label,operation){const c=await connection.connect();try{await c.query('BEGIN');const result=await operation(c);await c.query('COMMIT');return res.status(result.status||200).json(result.body);}catch(e){await c.query('ROLLBACK').catch(()=>{});return error(res,e,label);}finally{c.release();}}
+async function loadRecord(db,s,id,user){
+ const result=await db.query(`SELECT r.*,to_jsonb(i) AS original_snapshot,r.return_date::text AS return_date,i.${s.partyKey} AS party_id,i.invoice_number AS original_invoice_number,i.invoice_date::text AS original_invoice_date,
+ COALESCE(r.document_snapshot->'party'->>'name',p.name,'Walk-in customer') AS party_name,p.phone AS party_phone,st.name AS store_name,st.code AS store_code,a.name AS approved_by_name,c.name AS created_by_name,
+ acc.refund_amount AS effective_refund_amount,acc.${s.sales?'customer_credit':'supplier_credit'} AS effective_credit
+ FROM ${s.returns} r JOIN ${s.invoice} i ON i.id=r.${s.invoiceKey} LEFT JOIN ${s.party} p ON p.id=i.${s.partyKey} JOIN stores st ON st.id=r.store_id
+ LEFT JOIN users a ON a.id=${s.sales?'r.approved_by':'NULL::bigint'} LEFT JOIN users c ON c.id=r.created_by JOIN ${s.accounting} acc ON acc.id=r.id WHERE r.id=$1`,[id]);
+ if(!result.rowCount)fail('Return not found',404);const row=result.rows[0];await authorize(db,user,row.store_id);
+ if(!row.document_snapshot)row.document_snapshot=workflow.documentSnapshot({...row.original_snapshot,party_name:row.party_name,party_phone:row.party_phone},s);delete row.original_snapshot;
+ const lines=await db.query(`SELECT r.*,src.${s.invoiceKey} AS original_invoice_id,original.invoice_number AS source_invoice_number,original.invoice_date::text AS source_invoice_date,src.product_sku_snapshot AS sku,src.product_name_snapshot AS product_name,src.unit_id,src.unit_name_snapshot AS unit_name,src.unit_code_snapshot AS unit_code,src.product_snapshot,src.quantity AS original_quantity,
+ COALESCE((SELECT sum(x.quantity) FROM ${s.items} x JOIN ${s.returns} xr ON xr.id=x.${s.returnKey} WHERE x.${s.itemKey}=src.id AND xr.status='posted' AND xr.id<>$1),0)::numeric(18,4) AS previously_returned_quantity
+ FROM ${s.items} r JOIN ${s.invoiceItems} src ON src.id=r.${s.itemKey} JOIN ${s.invoice} original ON original.id=src.${s.invoiceKey} WHERE r.${s.returnKey}=$1 ORDER BY r.id`,[id]);
+ const originals=[...new Map(lines.rows.map(line=>[String(line.original_invoice_id),{id:line.original_invoice_id,invoice_number:line.source_invoice_number,invoice_date:line.source_invoice_date}])).values()];
+ if(s.sales&&originals.length)row.original_invoice_number=originals.map(inv=>inv.invoice_number).join(', ');
+ for(const line of lines.rows)if(!line.return_snapshot&&Number(line.tax_adjustment)>0)line.return_snapshot={taxBreakupKnown:false};
+ const allocations=(await db.query(`SELECT a.id,a.amount,a.${s.invoiceKey} AS invoice_id,i.invoice_number FROM return_credit_allocations a JOIN ${s.invoice} i ON i.id=a.${s.invoiceKey} WHERE a.${s.returnKey}=$1 ORDER BY a.id`,[id])).rows;
+ const refunds=(await db.query(`SELECT id,payment_number,status,payment_method,amount,payment_date,reference FROM payments WHERE ${s.returnKey}=$1`,[id])).rows;
+ const sums=(await db.query(`SELECT COALESCE(sum(taxable_adjustment),sum(line_total-tax_adjustment),0)::numeric(18,2) subtotal,COALESCE(sum(cgst_adjustment),0)::numeric(18,2) cgst,COALESCE(sum(sgst_adjustment),0)::numeric(18,2) sgst,COALESCE(sum(igst_adjustment),0)::numeric(18,2) igst,COALESCE(sum(quantity),0)::numeric(18,4) quantity FROM ${s.items} WHERE ${s.returnKey}=$1`,[id])).rows[0];
+ const applied=(await db.query(`SELECT COALESCE(sum(amount),0)::numeric(18,2) amount FROM return_credit_allocations WHERE ${s.returnKey}=$1`,[id])).rows[0].amount;
+ const credit=(await db.query('SELECT GREATEST($1::numeric-$2::numeric,0)::numeric(18,2) value',[row.effective_credit,applied])).rows[0].value;
+ const buckets=s.sales?(await db.query(`SELECT m.sales_return_item_id,bucket,sum(quantity_delta)::numeric(18,4) quantity FROM return_inventory_movements m JOIN sales_return_items r ON r.id=m.sales_return_item_id WHERE r.sales_return_id=$1 GROUP BY m.sales_return_item_id,bucket`,[id])).rows:[];
+ return {...row,original_invoices:originals,items:lines.rows,allocations,refunds,buckets,amounts:sums,adjusted_amount:row.workflow_version===2?applied:row.adjusted_amount,unapplied_credit:row.workflow_version===2?credit:row.unapplied_credit,current_party_balance:await partyBalance(db,s,row.store_id,row.party_id),permissions:await permissions(db,user,row.store_id),kind:s.kind};
 }
-async function storeAllowed(req,res,storeId) { if(!await canAccessStore(req.user,storeId)){res.status(403).json({message:"You do not have access to this store"});return false;}return true; }
-async function nextNumber(client,storeId,kind,series,date) {
-  const period=String(date).slice(0,4);
-  await client.query(`INSERT INTO invoice_number_sequences(store_id,document_type,series,period_key,next_number) VALUES($1,$2,$3,$4,1) ON CONFLICT(store_id,document_type,series,period_key) DO NOTHING`,[storeId,kind,series,period]);
-  const seq=await client.query("SELECT next_number FROM invoice_number_sequences WHERE store_id=$1 AND document_type=$2 AND series=$3 AND period_key=$4 FOR UPDATE",[storeId,kind,series,period]);
-  await client.query("UPDATE invoice_number_sequences SET next_number=next_number+1 WHERE store_id=$1 AND document_type=$2 AND series=$3 AND period_key=$4",[storeId,kind,series,period]);
-  return `${series}-${period}-${String(seq.rows[0].next_number).padStart(5,"0")}`;
-}
-
-export async function listReturns(req,res) {
-  const kind=req.query.type==="purchase"?"purchase":"sales", sales=kind==="sales", table=sales?"sales_returns":"purchase_returns", invoice=sales?"sales_invoices":"purchase_invoices", fk=sales?"sales_invoice_id":"purchase_invoice_id", party=sales?"customers":"suppliers", pfk=sales?"customer_id":"supplier_id";
-  try {
-    let ids;
-    if(admin(req)){const r=await connection.query("SELECT id FROM stores WHERE is_active=TRUE");ids=r.rows.map(x=>String(x.id));}
-    else {const r=await connection.query("SELECT store_id AS id FROM user_store_assignments WHERE user_id=$1 AND is_active=TRUE",[req.user.id]);ids=r.rows.map(x=>String(x.id));}
-    if(req.query.storeId){if(!validId(req.query.storeId)||!ids.includes(String(req.query.storeId)))return res.status(403).json({message:"You do not have access to this store"});ids=[String(req.query.storeId)];}
-    if(!ids.length)return res.json([]);
-    const params=[ids], where=[`r.store_id=ANY($1::bigint[])`];
-    if(req.query.status){params.push(req.query.status);where.push(`r.status=$${params.length}`);}
-    const result=await connection.query(`SELECT r.*,i.invoice_number AS original_invoice_number,COALESCE(p.name,${sales?"'Walk-in customer'":"'Supplier'"}) AS party_name,s.name AS store_name,
-      ${sales?"r.approved_at IS NOT NULL AS approved":"TRUE AS approved"} FROM ${table} r JOIN ${invoice} i ON i.id=r.${fk} LEFT JOIN ${party} p ON p.id=i.${pfk} JOIN stores s ON s.id=r.store_id WHERE ${where.join(" AND ")} ORDER BY r.return_date DESC,r.id DESC LIMIT 200`,params);
-    return res.json(result.rows);
-  } catch(e){return replyError(res,e,"Unable to list returns");}
-}
-
-export async function getReturnById(req,res) {
-  if(!validId(req.params.id))return res.status(400).json({message:"Invalid return ID"});
-  const kind=req.query.type==="purchase"?"purchase":"sales";
-  try{const row=await getReturn(kind,req.params.id);if(!row)return res.status(404).json({message:"Return not found"});if(!await storeAllowed(req,res,row.store_id))return;return res.json(row);}catch(e){return replyError(res,e,"Unable to load return");}
-}
-
-export async function createReturn(req,res) {
-  if(!["sales","purchase"].includes(req.params.type))return res.status(400).json({message:"Return type must be sales or purchase"});
-  const sales=req.params.type==="sales", b=req.body||{}, invoiceId=String(b.invoiceId||""), date=b.returnDate||new Date().toISOString().slice(0,10), items=b.items;
-  if(!validId(invoiceId)||!dateOk(date)||!Array.isArray(items)||!items.length||items.length>100)return res.status(400).json({message:"Choose an invoice, valid return date, and 1 to 100 item lines"});
-  if(items.some(x=>!x||!validId(x.invoiceItemId)||!validQty(x.quantity)||!String(x.reason||b.reason||"").trim()))return res.status(400).json({message:"Every line needs an original invoice line, positive quantity, and reason"});
-  if(!sales && items.some(x=>x.disposition))return res.status(400).json({message:"Disposition is only used for sales returns"});
-  const reason=String(b.reason||"").trim();
-  if(reason.length>1000||String(b.notes||"").length>4000)return res.status(400).json({message:"Return reason or notes are too long"});
-  const client=await connection.connect();
-  try {
-    await client.query("BEGIN");
-    const table=sales?"sales_invoices":"purchase_invoices", select=sales?"si.*":"pi.*", alias=sales?"si":"pi";
-    const source=await client.query(`SELECT ${select},s.code FROM ${table} ${alias} JOIN stores s ON s.id=${alias}.store_id WHERE ${alias}.id=$1 FOR UPDATE OF ${alias}`,[invoiceId]);
-    if(!source.rowCount)throw Object.assign(new Error("Original invoice not found"),{status:404});
-    const inv=source.rows[0];if(inv.status!=="posted")throw Object.assign(new Error("Returns require a posted original invoice"),{status:400});
-    if(!await storeAllowed(req,res,inv.store_id)){await client.query("ROLLBACK");return;}
-    if(b.storeId&&String(b.storeId)!==String(inv.store_id))throw Object.assign(new Error("Return store must match the original invoice"),{status:400});
-    const series=`${sales?"SR":"PR"}${inv.code}`.slice(0,32), docType=sales?"sales_return":"purchase_return";
-    const number=await nextNumber(client,inv.store_id,docType,series,date), idempotency=String(b.idempotencyKey||"").slice(0,120)||null;
-    if(idempotency){const exists=await client.query(`SELECT id FROM ${sales?"sales_returns":"purchase_returns"} WHERE idempotency_key=$1`,[idempotency]);if(exists.rowCount)throw Object.assign(new Error("This return request was already submitted"),{status:409});}
-    const header=sales
-      ? await client.query(`INSERT INTO sales_returns(store_id,sales_invoice_id,series,return_number,return_date,reason,notes,created_by,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,[inv.store_id,invoiceId,series,number,date,reason||null,String(b.notes||"").trim()||null,req.user.id,idempotency])
-      : await client.query(`INSERT INTO purchase_returns(store_id,purchase_invoice_id,series,return_number,return_date,reason,notes,created_by,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,[inv.store_id,invoiceId,series,number,date,reason||null,String(b.notes||"").trim()||null,req.user.id,idempotency]);
-    const id=header.rows[0].id;
-    for(const [i,line] of items.entries()){
-      const original=await client.query(sales
-        ? `SELECT id,product_id,quantity,unit_price,line_total,tax_rate,tax_amount,unit_id FROM sales_invoice_items WHERE id=$1 AND sales_invoice_id=$2 FOR SHARE`
-        : `SELECT id,product_id,quantity,unit_price,line_total,tax_rate,tax_amount,unit_id FROM purchase_invoice_items WHERE id=$1 AND purchase_invoice_id=$2 FOR SHARE`,[line.invoiceItemId,invoiceId]);
-      if(!original.rowCount)throw Object.assign(new Error(`Line ${i+1} does not belong to the original invoice`),{status:400});
-      const src=original.rows[0];
-      const prior=await client.query(sales
-        ? "SELECT COALESCE(sum(ri.quantity),0) qty FROM sales_return_items ri JOIN sales_returns r ON r.id=ri.sales_return_id WHERE ri.sales_invoice_item_id=$1 AND r.status='posted'"
-        : "SELECT COALESCE(sum(ri.quantity),0) qty FROM purchase_return_items ri JOIN purchase_returns r ON r.id=ri.purchase_return_id WHERE ri.purchase_invoice_item_id=$1 AND r.status='posted'",[src.id]);
-      const eligible=sales?src.quantity:(await client.query(`SELECT COALESCE(sum(pri.quantity_received) FILTER(WHERE pr.status='posted'),0)::numeric received FROM purchase_receipt_items pri JOIN purchase_receipts pr ON pr.id=pri.receipt_id WHERE pri.purchase_invoice_item_id=$1`,[src.id])).rows[0].received;
-      const within=await client.query("SELECT $1::numeric + $2::numeric <= $3::numeric AS valid",[prior.rows[0].qty,line.quantity,eligible]);
-      if(!within.rows[0].valid)throw Object.assign(new Error(`Line ${i+1} exceeds the remaining ${sales?"invoiced":"received"} returnable quantity`),{status:400});
-      const calculated=await client.query("SELECT round($1::numeric*$2::numeric/$3::numeric,2)::numeric(18,2) amount,round($4::numeric*$2::numeric/$3::numeric,2)::numeric(18,2) tax",[src.line_total,line.quantity,src.quantity,src.tax_amount]);
-      const amount=calculated.rows[0].amount,tax=calculated.rows[0].tax;
-      if(sales){
-        const dispositions={restock:String(line.restockQuantity??(line.disposition==="restock"?line.quantity:0)),quarantine:String(line.quarantinedQuantity??(line.disposition==="damaged"||line.disposition==="quarantined"?line.quantity:0)),supplier:String(line.supplierReturnPendingQuantity??(line.disposition==="supplier_return_pending"?line.quantity:0))};
-        if(Object.values(dispositions).some(x=>!/^\d{1,14}(\.\d{1,4})?$/.test(x))||!(await client.query("SELECT $1::numeric+$2::numeric+$3::numeric=$4::numeric AS valid",[dispositions.restock,dispositions.quarantine,dispositions.supplier,line.quantity])).rows[0].valid)throw Object.assign(new Error(`Line ${i+1} dispositions must add up to the return quantity`),{status:400});
-        const condition=line.productCondition||"resalable";if(!["resalable","damaged","unsuitable"].includes(condition))throw Object.assign(new Error(`Line ${i+1} has an invalid product condition`),{status:400});
-        if(condition!=="resalable"&&(await client.query("SELECT $1::numeric>0 AS value",[dispositions.restock])).rows[0].value)throw Object.assign(new Error(`Line ${i+1}: damaged or unsuitable goods cannot be restocked as sellable inventory`),{status:400});
-        await client.query(`INSERT INTO sales_return_items(sales_return_id,sales_invoice_item_id,product_id,quantity,unit_price,line_total,reason,product_condition,restock_quantity,quarantined_quantity,supplier_return_pending_quantity,tax_rate,tax_adjustment)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,[id,src.id,src.product_id,line.quantity,src.unit_price,amount,String(line.reason||reason).trim(),condition,dispositions.restock,dispositions.quarantine,dispositions.supplier,src.tax_rate,tax]);
-      } else {
-        await client.query(`INSERT INTO purchase_return_items(purchase_return_id,purchase_invoice_item_id,product_id,quantity,unit_cost,line_total,reason,tax_rate,tax_adjustment) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,[id,src.id,src.product_id,line.quantity,src.unit_price,amount,String(line.reason||reason).trim(),src.tax_rate,tax]);
-      }
-    }
-    const amounts=await client.query(sales?"SELECT COALESCE(sum(line_total),0)::numeric(18,2) AS total,COALESCE(sum(tax_adjustment),0)::numeric(18,2) AS tax FROM sales_return_items WHERE sales_return_id=$1":"SELECT COALESCE(sum(line_total),0)::numeric(18,2) AS total,COALESCE(sum(tax_adjustment),0)::numeric(18,2) AS tax FROM purchase_return_items WHERE purchase_return_id=$1",[id]);
-    const taxAdjustment=String(amounts.rows[0].tax);
-    const calculatedTotal=await client.query("SELECT ($1::numeric+$2::numeric-$3::numeric)::numeric(18,2) AS total",[amounts.rows[0].total,taxAdjustment,amounts.rows[0].tax]);
-    const amountTotal=calculatedTotal.rows[0].total;
-    if(sales){
-      const refund=String(b.refundAmount??0);if(!validMoney(refund)||!(await client.query("SELECT $1::numeric <= $2::numeric AS valid",[refund,amountTotal])).rows[0].valid)throw Object.assign(new Error("Refund cannot exceed the return credit"),{status:400});
-      const credit=(await client.query("SELECT ($1::numeric-$2::numeric)::numeric(18,2) AS amount",[amountTotal,refund])).rows[0].amount,method=b.refundMethod||null;
-      if(refund!=="0"&&(!method||!['cash','upi','card','bank_transfer','cheque','other'].includes(method)))throw Object.assign(new Error("Choose a valid refund method"),{status:400});
-      await client.query("UPDATE sales_returns SET total=$2,tax_adjustment=$3,refund_amount=$4,customer_credit=$5,refund_method=$6,refund_reference=$7 WHERE id=$1",[id,amountTotal,taxAdjustment,refund,credit,method,String(b.refundReference||"").slice(0,120)||null]);
-    }else{
-      await client.query("UPDATE purchase_returns SET total=$2,tax_adjustment=$3,supplier_credit=$2 WHERE id=$1",[id,amountTotal,taxAdjustment]);
-    }
-    await client.query("INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,after_data) VALUES($1,$2,$3,$4,$5,$6)",[inv.store_id,req.user.id,`${sales?"sales":"purchase"}_return.created`,`${sales?"sales":"purchase"}_return`,id,{returnNumber:number,invoiceId,items,total:amountTotal,refundAmount:sales?String(b.refundAmount??0):null,customerCredit:sales?String((await client.query("SELECT customer_credit FROM sales_returns WHERE id=$1",[id])).rows[0].customer_credit):null,supplierCredit:sales?null:amountTotal}]);
-    await client.query("COMMIT");return res.status(201).json(await getReturn(sales?"sales":"purchase",id));
-  }catch(e){await client.query("ROLLBACK").catch(()=>{});return replyError(res,e,"Unable to create return");}finally{client.release();}
-}
-
-export async function approveSalesReturn(req,res){
-  if(!validId(req.params.id))return res.status(400).json({message:"Invalid return ID"});
-  const client=await connection.connect();try{await client.query("BEGIN");const r=await client.query("SELECT * FROM sales_returns WHERE id=$1 FOR UPDATE",[req.params.id]);if(!r.rowCount)throw Object.assign(new Error("Sales return not found"),{status:404});if(!await storeAllowed(req,res,r.rows[0].store_id)){await client.query("ROLLBACK");return;}if(r.rows[0].status!=="draft"||r.rows[0].approved_at)throw Object.assign(new Error("Only an unapproved draft can be approved"),{status:409});if(!admin(req)){const a=await client.query("SELECT role FROM user_store_assignments WHERE user_id=$1 AND store_id=$2 AND is_active=TRUE",[req.user.id,r.rows[0].store_id]);if(!a.rowCount||!['owner','manager'].includes(a.rows[0].role))throw Object.assign(new Error("Manager approval is required"),{status:403});}
-    const updated=await client.query("UPDATE sales_returns SET approved_by=$2,approved_at=now() WHERE id=$1 RETURNING id",[req.params.id,req.user.id]);await client.query("INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,after_data) VALUES($1,$2,'sales_return.approved','sales_return',$3,$4)",[r.rows[0].store_id,req.user.id,req.params.id,{approvedAt:new Date().toISOString()}]);await client.query("COMMIT");return res.json(await getReturn("sales",updated.rows[0].id));
-  }catch(e){await client.query("ROLLBACK").catch(()=>{});return replyError(res,e,"Unable to approve sales return");}finally{client.release();}}
-
-export async function postReturn(req,res){
-  if(!["sales","purchase"].includes(req.params.type))return res.status(400).json({message:"Return type must be sales or purchase"});
-  const sales=req.params.type==="sales",table=sales?"sales_returns":"purchase_returns";if(!validId(req.params.id))return res.status(400).json({message:"Invalid return ID"});
-  const client=await connection.connect();try{await client.query("BEGIN");const r=await client.query(`SELECT * FROM ${table} WHERE id=$1 FOR UPDATE`,[req.params.id]);if(!r.rowCount)throw Object.assign(new Error("Return not found"),{status:404});const row=r.rows[0];if(!await storeAllowed(req,res,row.store_id)){await client.query("ROLLBACK");return;}if(row.status!=="draft")throw Object.assign(new Error("Only a draft return can be posted"),{status:409});if(sales&&(!row.approved_at||!row.approved_by))throw Object.assign(new Error("Sales return requires manager approval"),{status:409});if(!sales&&!await canManageStore(req.user,row.store_id,["owner","manager"],client)){await client.query("ROLLBACK");return res.status(403).json({message:"Manager authorization is required to post a purchase return"});}
-    await client.query(`UPDATE ${table} SET status='posted',posted_at=now() WHERE id=$1`,[row.id]);await client.query("INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,before_data,after_data) VALUES($1,$2,$3,$4,$5,$6,$7)",[row.store_id,req.user.id,`${sales?"sales":"purchase"}_return.posted`,`${sales?"sales":"purchase"}_return`,row.id,{status:"draft"},{status:"posted",total:row.total}]);await client.query("COMMIT");return res.json(await getReturn(sales?"sales":"purchase",row.id));
-  }catch(e){await client.query("ROLLBACK").catch(()=>{});return replyError(res,e,"Unable to post return");}finally{client.release();}}
+export async function getReturnById(req,res){try{if(!idOk(req.params.id))fail('Invalid return ID',400);return res.json(await loadRecord(connection,spec(req.query.type||req.params.type||'sales'),req.params.id,req.user));}catch(e){return error(res,e,'Unable to load return');}}
+export async function listReturns(req,res){try{
+ const s=spec(req.query.type||'sales');let ids;
+ if(req.user.userType?.toLowerCase()==='admin')ids=(await connection.query('SELECT id FROM stores WHERE is_active=TRUE')).rows.map(r=>String(r.id));
+ else ids=(await connection.query('SELECT store_id AS id FROM user_store_assignments WHERE user_id=$1 AND is_active=TRUE',[req.user.id])).rows.map(r=>String(r.id));
+ if(req.query.storeId){if(!ids.includes(String(req.query.storeId)))fail('You do not have access to this store',403);ids=[String(req.query.storeId)];}
+ if(!ids.length)return res.json([]);
+ const values=[ids],where=['r.store_id=ANY($1::bigint[])'];const add=(sql,value)=>{values.push(value);where.push(sql.replace('?',`$${values.length}`));};
+ if(req.query.status)add('r.status=?',req.query.status);if(req.query.partyId){if(!idOk(req.query.partyId))fail('Invalid party ID',400);add(`i.${s.partyKey}=?`,req.query.partyId);}
+ for(const [key,operator] of [['fromDate','>='],['toDate','<=']])if(req.query[key]){if(!validDate(req.query[key]))fail('Use valid date filters',400);add(`r.return_date${operator}?::date`,req.query[key]);}
+ if(req.query.q){
+  values.push(`%${String(req.query.q).slice(0,100)}%`);const match='$'+values.length;
+  where.push(`(r.return_number ILIKE ${match} OR i.invoice_number ILIKE ${match} OR p.name ILIKE ${match}${s.sales?` OR EXISTS(SELECT 1 FROM sales_return_items ri JOIN sales_invoice_items si ON si.id=ri.sales_invoice_item_id JOIN sales_invoices original ON original.id=si.sales_invoice_id WHERE ri.sales_return_id=r.id AND original.invoice_number ILIKE ${match})`:''})`);
+ }
+ const rows=(await connection.query(`SELECT r.*,${s.sales?`COALESCE((SELECT string_agg(DISTINCT original.invoice_number, ', ' ORDER BY original.invoice_number) FROM sales_return_items ri JOIN sales_invoice_items si ON si.id=ri.sales_invoice_item_id JOIN sales_invoices original ON original.id=si.sales_invoice_id WHERE ri.sales_return_id=r.id),i.invoice_number)`:'i.invoice_number'} AS original_invoice_number,i.${s.partyKey} AS party_id,COALESCE(p.name,'Walk-in customer') AS party_name,st.name AS store_name,
+ ${s.sales?'r.approved_at IS NOT NULL':'TRUE'} AS approved,acc.refund_amount AS effective_refund_amount,
+ COALESCE(a.amount,0)::numeric(18,2) AS applied_credit,GREATEST(acc.${s.sales?'customer_credit':'supplier_credit'}-COALESCE(a.amount,0),0)::numeric(18,2) AS credit_balance
+ FROM ${s.returns} r JOIN ${s.invoice} i ON i.id=r.${s.invoiceKey} LEFT JOIN ${s.party} p ON p.id=i.${s.partyKey} JOIN stores st ON st.id=r.store_id JOIN ${s.accounting} acc ON acc.id=r.id
+ LEFT JOIN LATERAL(SELECT sum(amount) amount FROM return_credit_allocations x WHERE x.${s.returnKey}=r.id) a ON TRUE
+ WHERE ${where.join(' AND ')} ORDER BY r.return_date DESC,r.id DESC LIMIT 200`,values)).rows;return res.json(rows);
+ }catch(e){return error(res,e,'Unable to list returns');}}
+export async function eligibleReturnInvoices(req,res){try{
+ const s=spec(req.query.type||'sales'),storeId=req.query.storeId,partyId=req.query.partyId;if(!idOk(storeId)||!idOk(partyId))fail('Select a store and party',400);await authorize(connection,req.user,storeId);
+ const rows=(await connection.query(`SELECT i.id,i.invoice_number,i.invoice_date,i.total,i.${s.partyKey} AS party_id FROM ${s.invoice} i WHERE i.store_id=$1 AND i.${s.partyKey}=$2 AND i.status='posted' AND ($3::text='' OR i.invoice_number ILIKE '%'||$3||'%') ORDER BY i.invoice_date DESC,i.id DESC LIMIT 200`,[storeId,partyId,String(req.query.q||'').slice(0,100)])).rows;
+ for(const row of rows){const lines=await sourceItems(connection,s,row.id);const available=(await connection.query('SELECT COALESCE(sum(round(x.line_total*x.remaining_quantity/NULLIF(x.quantity,0),2)),0)::numeric(18,2) amount,COALESCE(sum(x.remaining_quantity),0)::numeric(18,4) quantity FROM jsonb_to_recordset($1::jsonb) AS x(line_total numeric,remaining_quantity numeric,quantity numeric)',[JSON.stringify(lines)])).rows[0];row.returnable_amount=available.amount;row.returnable_quantity=available.quantity;}
+ return res.json(rows);
+ }catch(e){return error(res,e,'Unable to load returnable invoices');}}
+export async function returnInvoiceSource(req,res){try{
+ const s=spec(req.params.type),inv=await sourceInvoice(connection,s,req.params.id);await authorize(connection,req.user,inv.store_id);
+ return res.json({invoice:inv,items:await sourceItems(connection,s,inv.id),permissions:await permissions(connection,req.user,inv.store_id),partyBalance:await partyBalance(connection,s,inv.store_id,inv[s.partyKey])});
+ }catch(e){return error(res,e,'Unable to load original invoice products');}}
+export async function previewReturn(req,res){return transaction(req,res,'Unable to calculate return preview',async c=>{const s=spec(req.params.type),data=await calculate(c,s,req.body,req.user,{excludeReturnId:req.body.returnId||null});return {body:{amounts:data.amounts,outstandingBefore:data.outstanding,adjustedAmount:data.adjusted,creditAmount:data.credit,refundAmount:data.refund,items:data.lines.map(x=>({invoiceItemId:x.source.id,invoiceId:x.source.original_invoice.id,invoiceNumber:x.source.original_invoice.invoice_number,total:x.total,tax:x.tax,taxable:x.taxable,rate:x.rate,cgst:x.cgst,sgst:x.sgst,igst:x.igst}))}};});}
+export async function createReturn(req,res){return transaction(req,res,'Unable to create return draft',async c=>{
+ const s=spec(req.params.type),b=req.body||{},key=String(b.idempotencyKey||'').slice(0,120)||null,hash=workflow.fingerprint(b);
+ if(key){await c.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`return:${s.kind}:${key}`]);const prior=await c.query(`SELECT id,store_id,request_fingerprint FROM ${s.returns} WHERE idempotency_key=$1`,[key]);if(prior.rowCount){await authorize(c,req.user,prior.rows[0].store_id);if(prior.rows[0].request_fingerprint!==hash)fail('Return request key was reused with different details',409);return {body:{...await loadRecord(c,s,prior.rows[0].id,req.user),duplicate:true}};}}
+ const sources=await workflow.returnSources(c,s,b,req.user,{lock:true}),inv=sources[0];
+ const data=await calculate(c,s,b,req.user),id=await workflow.writeDraft(c,s,data,req.user,null,key,hash);await audit(c,req.user,s,id,inv.store_id,'created',{invoiceId:inv.id,invoiceIds:data.invoices.map(source=>source.id),total:data.amounts.total,mode:data.mode,rateChanges:data.lines.filter(x=>x.rateReason).map(x=>({originalRate:x.source.unit_price,returnRate:x.rate,reason:x.rateReason}))});
+ return {status:201,body:await loadRecord(c,s,id,req.user)};
+ });}
+export async function updateReturn(req,res){return transaction(req,res,'Unable to update return draft',async c=>{
+ const s=spec(req.params.type);if(!idOk(req.params.id))fail('Invalid return ID',400);const r=await c.query(`SELECT * FROM ${s.returns} WHERE id=$1 FOR UPDATE`,[req.params.id]);if(!r.rowCount)fail('Return not found',404);const row=r.rows[0];await authorize(c,req.user,row.store_id);
+ if(row.workflow_version!==2)fail('Legacy returns keep their original workflow; cancel this draft and create a replacement to use new settlement options',409);
+ if(row.status!=='draft'||row.approved_at)fail('Only an unapproved draft can be edited; cancel an approved draft and create a replacement',409);if(!s.sales&&String(req.body.invoiceId)!==String(row[s.invoiceKey]))fail('The original invoice cannot be changed on an existing return',409);
+ const previous=await sourceInvoice(c,s,row[s.invoiceKey]),sources=await workflow.returnSources(c,s,req.body,req.user,{lock:true});
+ if(String(sources[0].store_id)!==String(row.store_id)||String(sources[0][s.partyKey])!==String(previous[s.partyKey]))fail('An existing return must keep the same party and store');
+ const data=await calculate(c,s,req.body,req.user,{excludeReturnId:row.id});await workflow.writeDraft(c,s,data,req.user,row.id);await audit(c,req.user,s,row.id,row.store_id,'updated',{total:data.amounts.total,invoiceIds:data.invoices.map(source=>source.id)});return {body:await loadRecord(c,s,row.id,req.user)};
+ });}
+export async function approveSalesReturn(req,res){return transaction(req,res,'Unable to approve sales return',async c=>{
+ const s=spec('sales'),r=await c.query('SELECT * FROM sales_returns WHERE id=$1 FOR UPDATE',[req.params.id]);if(!r.rowCount)fail('Return not found',404);const row=r.rows[0];await authorize(c,req.user,row.store_id,true);if(row.status!=='draft'||row.approved_at)fail('Only an unapproved draft can be approved',409);
+ await c.query('UPDATE sales_returns SET approved_by=$2,approved_at=now() WHERE id=$1',[row.id,req.user.id]);await audit(c,req.user,s,row.id,row.store_id,'approved',{});return {body:await loadRecord(c,s,row.id,req.user)};
+ });}
+async function finalize(req,res,modern){return transaction(req,res,'Unable to finalize return',async c=>{
+ const s=spec(req.params.type);if(!idOk(req.params.id))fail('Invalid return ID',400);const r=await c.query(`SELECT r.*,r.return_date::text AS return_date,i.${s.partyKey} AS party_id FROM ${s.returns} r JOIN ${s.invoice} i ON i.id=r.${s.invoiceKey} WHERE r.id=$1 FOR UPDATE OF r`,[req.params.id]);if(!r.rowCount)fail('Return not found',404);const row=r.rows[0];await authorize(c,req.user,row.store_id);
+ const key=String(req.body?.idempotencyKey||'').slice(0,120);if(row.status==='posted'&&modern&&key&&key===row.finalization_key)return {body:{...await loadRecord(c,s,row.id,req.user),duplicate:true}};
+ if(row.status!=='draft')fail('Only a draft return can be finalized',409);if(modern&&!key)fail('A finalization request key is required',400);
+ if(modern||!s.sales)await authorize(c,req.user,row.store_id,true);if(!modern&&s.sales&&!row.approved_at)fail('Sales return requires manager approval',409);
+ await invoiceBalances(c,s,row.store_id,row.party_id,true);
+ await c.query(`SELECT id FROM ${s.invoice} WHERE id=$1 FOR UPDATE`,[row[s.invoiceKey]]);const inv=await sourceInvoice(c,s,row[s.invoiceKey]);
+ const lines=(await c.query(`SELECT * FROM ${s.items} WHERE ${s.returnKey}=$1 ORDER BY id`,[row.id])).rows;if(!lines.length)fail('Add a return product');
+ const sources=await workflow.returnSources(c,s,{invoiceId:inv.id,items:lines.map(line=>({invoiceItemId:line[s.itemKey]}))},req.user,{lock:true});
+ const returnDate=row.return_date instanceof Date?row.return_date.toISOString().slice(0,10):String(row.return_date).slice(0,10);if(sources.some(source=>returnDate<source.invoice_date))fail('Return date cannot precede an original invoice');
+ const originals=[];for(const source of sources)originals.push(...await sourceItems(c,s,source.id,row.id));
+ for(const line of lines){const src=originals.find(x=>String(x.id)===String(line[s.itemKey]));if(!src||!(await c.query('SELECT $1::numeric<=$2::numeric AND $3::numeric+$4::numeric<=$5::numeric AS ok',[line.quantity,src.remaining_quantity,line.line_total,src.previously_returned_amount,src.line_total])).rows[0].ok)fail('A product quantity or value is no longer returnable. Refresh or replace this draft.',409);}
+ for(const line of lines){const src=originals.find(x=>String(x.id)===String(line[s.itemKey]));if(row.workflow_version===2&&!(await c.query('SELECT $1::numeric+$2::numeric<=$3::numeric AND $4::numeric+$5::numeric<=$6::numeric AS ok',[line.tax_adjustment,src.previously_returned_tax,src.tax_amount,line.taxable_adjustment,src.previously_returned_taxable,src.taxable_value])).rows[0].ok)fail('Original tax eligibility changed after this draft was saved. Edit and review the draft again.',409);}
+ await workflow.lockReturnInventory(c,row.store_id,lines);
+ const before=await partyBalance(c,s,row.store_id,row.party_id);
+ const expected=(await c.query('SELECT LEAST($1::numeric,GREATEST($2::numeric,0))::numeric(18,2) adjusted,($1::numeric-$3::numeric)::numeric(18,2) credit',[row.total,before,row.refund_amount])).rows[0];
+ const adjusted=row.settlement_mode==='CREDIT'?'0.00':expected.adjusted;
+ if(!(await c.query('SELECT $1::numeric+$2::numeric<=$3::numeric AS ok',[adjusted,row.refund_amount,row.total])).rows[0].ok)fail('Refund exceeds credit available after outstanding adjustment; edit the unapproved draft',409);
+ if(Number(row.refund_amount)>0){if(!hasPermission(req.user,'payments.manage'))fail('Payment-management permission is required for refunds',403);if(!(await c.query('SELECT 1 FROM payment_method_options WHERE code=$1 AND is_active=TRUE',[row.refund_method])).rowCount)fail('The selected refund payment method is no longer active');}
+ let allocations=[];
+ if(row.workflow_version===2&&Number(adjusted)>0)allocations=await workflow.distributeCredit(c,s,row,adjusted,req.user);
+ const applied=(await c.query('SELECT COALESCE(sum(x.amount),0)::numeric(18,2) amount FROM jsonb_to_recordset($1::jsonb) AS x(amount numeric)',[JSON.stringify(allocations)])).rows[0].amount;
+ const remaining=(await c.query('SELECT ($1::numeric-$2::numeric)::numeric(18,2) amount',[expected.credit,applied])).rows[0].amount;
+ const refundPaymentId=row.workflow_version===2?await workflow.recordRefund(c,s,row,req.user):null;
+ await c.query(`UPDATE ${s.returns} SET status='posted',posted_at=now(),outstanding_before=$2,adjusted_amount=$3,unapplied_credit=$4,finalization_key=$5${s.sales?',approved_at=COALESCE(approved_at,now()),approved_by=COALESCE(approved_by,$6)':''} WHERE id=$1`,s.sales?[row.id,before,applied,remaining,key||null,req.user.id]:[row.id,before,applied,remaining,key||null]);
+ if(s.sales)await adjustInvoiceBonusForReturn(c,row.id,req.user.id);
+ await audit(c,req.user,s,row.id,row.store_id,'posted',{invoiceIds:sources.map(source=>source.id),total:row.total,adjusted:applied,credit:remaining,refundPaymentId,requestKey:key||null});return {body:await loadRecord(c,s,row.id,req.user)};
+ });}
+export const postReturn=(req,res)=>finalize(req,res,false);
+export const finalizeReturn=(req,res)=>finalize(req,res,true);
+export async function changeReturnStatus(req,res){return transaction(req,res,'Unable to change return status',async c=>{
+ const s=spec(req.params.type),r=await c.query(`SELECT * FROM ${s.returns} WHERE id=$1 FOR UPDATE`,[req.params.id]);if(!r.rowCount)fail('Return not found',404);const row=r.rows[0];await authorize(c,req.user,row.store_id,true);
+ const next=req.params.action==='cancel'?'cancelled':'reversed';if(next==='cancelled'&&row.status!=='draft'||next==='reversed'&&row.status!=='posted')fail('The return cannot make this status transition',409);
+ const reason=String(req.body?.reason||'').trim();if(reason.length<3||reason.length>1000)fail('Provide a correction reason of 3 to 1000 characters',400);
+ const originalLines=(await c.query(`SELECT product_id FROM ${s.items} WHERE ${s.returnKey}=$1`,[row.id])).rows;await workflow.lockReturnInventory(c,row.store_id,originalLines);
+ await c.query(`UPDATE ${s.returns} SET status=$2 WHERE id=$1`,[row.id,next]);
+ if(s.sales&&next==='reversed')await c.query("INSERT INTO sales_bonus_adjustments(sales_bonus_record_id,store_id,source_type,source_id,source_item_id,amount,reason,created_by) SELECT sales_bonus_record_id,store_id,'sales_return_reversal',source_id,source_item_id,-amount,'Sales return reversed',$2 FROM sales_bonus_adjustments WHERE source_type='sales_return_item' AND source_id=$1 ON CONFLICT DO NOTHING",[row.id,req.user.id]);
+ await audit(c,req.user,s,row.id,row.store_id,next,{reason});return {body:await loadRecord(c,s,row.id,req.user)};
+ });}
+export async function inspectReturn(req,res){return transaction(req,res,'Unable to record return inspection',async c=>{
+ const s=spec('sales'),r=await c.query('SELECT * FROM sales_returns WHERE id=$1 FOR UPDATE',[req.params.id]);if(!r.rowCount)fail('Return not found',404);const row=r.rows[0];await authorize(c,req.user,row.store_id,true);if(!hasPermission(req.user,'inventory.manage'))fail('Inventory-management permission is required',403);if(row.status!=='posted')fail('Only a posted return can be inspected');
+ const b=req.body||{},key=String(b.idempotencyKey||'');if(key.length<8||key.length>100||!idOk(b.itemId)||!['SELLABLE','DAMAGED'].includes(b.decision)||!String(b.reason||'').trim())fail('Select a returned item, inspection decision, reason, and request key',400);
+ const prior=await c.query("SELECT after_data FROM audit_logs WHERE action='sales_return.inspected' AND entity_id=$1 AND after_data->>'requestKey'=$2",[row.id,key]);if(prior.rowCount){if(prior.rows[0].after_data.fingerprint!==workflow.fingerprint(b))fail('Inspection key was reused with different details',409);return {body:{...await loadRecord(c,s,row.id,req.user),duplicate:true}};}
+ const item=(await c.query('SELECT * FROM sales_return_items WHERE sales_return_id=$1 AND id=$2',[row.id,b.itemId])).rows[0];if(!item)fail('Returned product not found',404);
+ await workflow.lockReturnInventory(c,row.store_id,[item]);
+ if(!/^\d{1,14}(\.\d{1,4})?$/.test(String(b.quantity))||Number(b.quantity)<=0)fail('Enter a positive inspection quantity');
+ const precision=Math.min(4,item.return_snapshot?.unitDecimalPlaces??4);if((String(b.quantity).split('.')[1]||'').replace(/0+$/,'').length>precision)fail('Inspection quantity uses more decimals than the original unit permits');
+ const available=(await c.query("SELECT COALESCE(sum(quantity_delta),0)::numeric(18,4) quantity FROM return_inventory_movements WHERE sales_return_item_id=$1 AND bucket='PENDING_INSPECTION'",[item.id])).rows[0].quantity;
+ const delta=(await c.query('SELECT round($1::numeric*$2::numeric,4)::numeric(18,4) amount',[b.quantity,item.conversion_factor_to_base||1])).rows[0].amount;
+ if(!(await c.query('SELECT $1::numeric<=$2::numeric AS ok',[delta,available])).rows[0].ok)fail('Inspection quantity exceeds pending stock');
+ await c.query("INSERT INTO return_inventory_movements(store_id,product_id,sales_return_item_id,bucket,quantity_delta,source_type,source_id,idempotency_key,reason,created_by) VALUES($1,$2,$3,'PENDING_INSPECTION',-$4::numeric,'return_inspection',$5,$6,$7,$8)",[row.store_id,item.product_id,item.id,delta,row.id,`inspection:${row.id}:${key}:out`,String(b.reason).slice(0,1000),req.user.id]);
+ if(b.decision==='DAMAGED')await c.query("INSERT INTO return_inventory_movements(store_id,product_id,sales_return_item_id,bucket,quantity_delta,source_type,source_id,idempotency_key,reason,created_by) VALUES($1,$2,$3,'DAMAGED',$4,'return_inspection',$5,$6,$7,$8)",[row.store_id,item.product_id,item.id,delta,row.id,`inspection:${row.id}:${key}:in`,String(b.reason).slice(0,1000),req.user.id]);
+ else await c.query("INSERT INTO stock_movements(store_id,product_id,movement_type,quantity_delta,source_type,source_id,source_line_id,idempotency_key,created_by) VALUES($1,$2,'sales_return',$3,'return_inspection',$4,$5,$6,$7)",[row.store_id,item.product_id,delta,row.id,item.id,`inspection:${row.id}:${key}`,req.user.id]);
+ await audit(c,req.user,s,row.id,row.store_id,'inspected',{...b,requestKey:key,fingerprint:workflow.fingerprint(b)});return {body:await loadRecord(c,s,row.id,req.user)};
+ });}
+export async function applyReturnCredit(req,res){return transaction(req,res,'Unable to apply return credit',async c=>{
+ const s=spec(req.params.type),r=await c.query(`SELECT r.*,r.return_date::text AS return_date,i.${s.partyKey} AS party_id FROM ${s.returns} r JOIN ${s.invoice} i ON i.id=r.${s.invoiceKey} WHERE r.id=$1 FOR UPDATE OF r`,[req.params.id]);if(!r.rowCount)fail('Return not found',404);const row=r.rows[0];await authorize(c,req.user,row.store_id,true);if(row.workflow_version!==2||row.status!=='posted')fail('Only new posted return credit can be applied');
+ const key=String(req.body?.idempotencyKey||'');if(key.length<8||key.length>100)fail('An allocation request key is required',400);
+ const previous=await c.query("SELECT 1 FROM audit_logs WHERE action=$1 AND entity_id=$2 AND after_data->>'requestKey'=$3",[`${s.kind}_return.credit_applied`,row.id,key]);if(previous.rowCount)return {body:{...await loadRecord(c,s,row.id,req.user),duplicate:true}};
+ const current=await loadRecord(c,s,row.id,req.user);if(Number(current.unapplied_credit)<=0)fail('This return has no remaining credit',409);
+ const allocations=await workflow.distributeCredit(c,s,row,current.unapplied_credit,req.user);if(!allocations.length)fail('No outstanding invoices are available for this party in this store',409);
+ await audit(c,req.user,s,row.id,row.store_id,'credit_applied',{requestKey:key,allocations});return {body:await loadRecord(c,s,row.id,req.user)};
+ });}
+export async function returnPartyBalance(req,res){try{const s=spec(req.query.type||'sales');if(!idOk(req.query.storeId)||!idOk(req.query.partyId))fail('Select an authorized store and party',400);await authorize(connection,req.user,req.query.storeId);const amount=await partyBalance(connection,s,req.query.storeId,req.query.partyId);return res.json({totalOutstanding:amount,amountDue:Number(amount)>0?amount:'0.00',creditBalance:Number(amount)<0?String(amount).slice(1):'0.00'});}catch(e){return error(res,e,'Unable to load party balance');}}
+export async function returnSummary(req,res){try{
+ let stores=req.user.userType?.toLowerCase()==='admin'?(await connection.query('SELECT id FROM stores WHERE is_active=TRUE')).rows.map(row=>String(row.id)):(await connection.query('SELECT store_id AS id FROM user_store_assignments WHERE user_id=$1 AND is_active=TRUE',[req.user.id])).rows.map(row=>String(row.id));
+ if(req.query.storeId){if(!stores.includes(String(req.query.storeId)))fail('You do not have access to this store',403);stores=[String(req.query.storeId)];}
+ const from=req.query.fromDate||null,to=req.query.toDate||null;if(from&&!validDate(from)||to&&!validDate(to)||from&&to&&from>to)fail('Use a valid return-report date range',400);
+ const result=await connection.query(`WITH documents AS (
+ SELECT 'sales' kind,total,invoice_date date FROM sales_invoices WHERE store_id=ANY($1::bigint[]) AND status='posted'
+ UNION ALL SELECT 'purchase',total,invoice_date FROM purchase_invoices WHERE store_id=ANY($1::bigint[]) AND status='posted'
+ UNION ALL SELECT 'sales_return',total,return_date FROM sales_returns WHERE store_id=ANY($1::bigint[]) AND status='posted'
+ UNION ALL SELECT 'purchase_return',total,return_date FROM purchase_returns WHERE store_id=ANY($1::bigint[]) AND status='posted'
+ ),totals AS (SELECT COALESCE(sum(total) FILTER(WHERE kind='sales'),0)::numeric(18,2) gross_sales,COALESCE(sum(total) FILTER(WHERE kind='purchase'),0)::numeric(18,2) gross_purchases,
+ COALESCE(sum(total) FILTER(WHERE kind='sales_return'),0)::numeric(18,2) sales_returns,COALESCE(sum(total) FILTER(WHERE kind='purchase_return'),0)::numeric(18,2) purchase_returns FROM documents WHERE date>=COALESCE($2::date,'1900-01-01') AND date<=COALESCE($3::date,CURRENT_DATE))
+ SELECT *, (gross_sales-sales_returns)::numeric(18,2) net_sales,(gross_purchases-purchase_returns)::numeric(18,2) net_purchases,
+ (SELECT COALESCE(sum(GREATEST(r.customer_credit-COALESCE((SELECT sum(a.amount) FROM return_credit_allocations a WHERE a.sales_return_id=r.id),0),0)),0)::numeric(18,2) FROM sales_return_accounting r JOIN sales_returns src ON src.id=r.id WHERE r.store_id=ANY($1::bigint[]) AND r.status='posted' AND src.workflow_version=2 AND r.return_date<=COALESCE($3::date,CURRENT_DATE)) customer_return_credits,
+ (SELECT COALESCE(sum(GREATEST(r.supplier_credit-COALESCE((SELECT sum(a.amount) FROM return_credit_allocations a WHERE a.purchase_return_id=r.id),0),0)),0)::numeric(18,2) FROM purchase_return_accounting r JOIN purchase_returns src ON src.id=r.id WHERE r.store_id=ANY($1::bigint[]) AND r.status='posted' AND src.workflow_version=2 AND r.return_date<=COALESCE($3::date,CURRENT_DATE)) supplier_return_credits,
+ (SELECT COALESCE(sum(GREATEST(-balance,0)),0)::numeric(18,2) FROM (SELECT party_id,sum(debit-credit) balance FROM (${businessCustomerEntries}) e WHERE store_id=ANY($1::bigint[]) AND entry_date<=COALESCE($3::date,CURRENT_DATE) AND party_id IS NOT NULL GROUP BY store_id,party_id) x) customer_net_credit,
+ (SELECT COALESCE(sum(GREATEST(-balance,0)),0)::numeric(18,2) FROM (SELECT party_id,sum(credit-debit) balance FROM (${businessSupplierEntries}) e WHERE store_id=ANY($1::bigint[]) AND entry_date<=COALESCE($3::date,CURRENT_DATE) AND party_id IS NOT NULL GROUP BY store_id,party_id) x) supplier_net_credit
+ FROM totals`,[stores,from,to]);return res.json(result.rows[0]);
+ }catch(e){return error(res,e,'Unable to calculate return report');}}

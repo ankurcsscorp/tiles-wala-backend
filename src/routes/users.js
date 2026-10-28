@@ -1,8 +1,14 @@
+import {currentUser,listManagedUsers,permissionCatalog,updateManagedUser,updateRolePermissions} from '../controllers/users.js';
 import express from "express";
 import { connection } from "../../connection.js";
 import { requireAuth, requireUserTypes } from "../middleware/auth.js";
 
 const router = express.Router();
+router.get('/me',requireAuth,currentUser);
+router.get('/',requireAuth,requireUserTypes('Admin'),listManagedUsers);
+router.get('/permissions',requireAuth,requireUserTypes('Admin'),permissionCatalog);
+router.put('/roles/:userType',requireAuth,requireUserTypes('Admin'),updateRolePermissions);
+router.put('/:id/access',requireAuth,requireUserTypes('Admin'),updateManagedUser);
 
 router.get("/search", requireAuth, requireUserTypes("Admin"), async (req, res) => {
   try {

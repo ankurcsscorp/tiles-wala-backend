@@ -21,12 +21,12 @@ test('store invoice types persist independently and preserve sales stock, paymen
    await client.query("INSERT INTO user_store_assignments(user_id,store_id,role) VALUES($1,$2,'manager')",[user.id,store.id]);
   }
   const invoke=async(fn,store,body)=>{const r=response();await fn({user,params:{id:String(store.id)},body},r);return r;};
-  let result=await invoke(getInvoiceSettings,stores[0]);assert.equal(result.body.data.invoiceType,'GST');
-  result=await invoke(putInvoiceSettings,stores[0],{invoiceType:'NON_GST'});assert.equal(result.statusCode,422);
+  let result=await invoke(getInvoiceSettings,stores[0]);assert.equal(result.body.data.invoiceType,'NON_GST');
+  result=await invoke(putInvoiceSettings,stores[0],{billingMode:'NON_GST'});assert.equal(result.statusCode,200);
   result=await invoke(putInvoiceSettings,stores[0],{invoiceType:'bogus'});assert.equal(result.statusCode,400);
   result=await invoke(putInvoiceSettings,stores[0],{invoiceType:'NON_GST',registrationStatus:'UNREGISTERED'});assert.equal(result.statusCode,200,JSON.stringify(result.body));
   assert.equal((await invoke(getInvoiceSettings,stores[0])).body.data.invoiceType,'NON_GST');
-  assert.equal((await invoke(getInvoiceSettings,stores[1])).body.data.invoiceType,'GST');
+  assert.equal((await invoke(getInvoiceSettings,stores[1])).body.data.invoiceType,'NON_GST');
   await client.query("UPDATE user_store_assignments SET role='staff' WHERE user_id=$1",[user.id]);
   assert.equal((await invoke(putInvoiceSettings,stores[0],{invoiceType:'GST'})).statusCode,403);
   await client.query("UPDATE user_store_assignments SET role='manager' WHERE user_id=$1",[user.id]);
@@ -46,13 +46,10 @@ test('store invoice types persist independently and preserve sales stock, paymen
   const stale=response();await createSalesDraft({user,body:{...body,invoiceLayout:'STANDARD_GST_LAYOUT'}},stale);assert.equal(stale.statusCode,409);
   const edited=response();await updateSalesDraft({user,params:{id:draft.body.id},body},edited);assert.equal(edited.statusCode,200,JSON.stringify(edited.body));assert.equal(edited.body.invoice_type,'NON_GST');
   const converted=response();await updateSalesDraft({user,params:{id:draft.body.id},body:{...body,invoiceType:'GST'}},converted);assert.equal(converted.statusCode,409);
-  // Current registration is rechecked even after a draft was saved.
+  // A later GST opt-in preserves an existing Non-GST draft without changing its treatment.
   await client.query("UPDATE stores SET gstin='10JNEPD0678B1ZL' WHERE id=$1",[stores[0].id]);
   await invoke(putInvoiceSettings,stores[0],{invoiceType:'GST',registrationStatus:'REGISTERED',registrationCategory:'REGULAR'});
-  let posted=response();await finalizeSales({user,params:{id:draft.body.id},body:{}},posted);assert.equal(posted.statusCode,422);
-  await client.query('UPDATE stores SET gstin=NULL,tax_id=NULL WHERE id=$1',[stores[0].id]);
-  await invoke(putInvoiceSettings,stores[0],{invoiceType:'NON_GST',registrationStatus:'UNREGISTERED'});
-  posted=response();await finalizeSales({user,params:{id:draft.body.id},body:{payment:{amount:'400',method:'cash',idempotencyKey:suffix}}},posted);assert.equal(posted.statusCode,200,JSON.stringify(posted.body));
+  const posted=response();await finalizeSales({user,params:{id:draft.body.id},body:{payment:{amount:'400',method:'cash',idempotencyKey:suffix}}},posted);assert.equal(posted.statusCode,200,JSON.stringify(posted.body));
   assert.equal(posted.body.invoice_type,'NON_GST');assert.equal(posted.body.total,'12400.00');assert.equal(posted.body.outstanding_balance,'12000.00');assert.equal(posted.body.amount_received,'400.00');
   assert.equal((await client.query('SELECT quantity FROM inventory_balances WHERE store_id=$1 AND product_id=$2',[stores[0].id,products[0].id])).rows[0].quantity,'90.0000');
   const retry=response();await finalizeSales({user,params:{id:draft.body.id},body:{}},retry);assert.equal(retry.statusCode,409);
@@ -79,9 +76,11 @@ test('store invoice types persist independently and preserve sales stock, paymen
   const reversePosted=response();await finalizeSales({user,params:{id:reversible.body.id},body:{}},reversePosted);assert.equal(reversePosted.statusCode,200);
   const reversed=response();await reverseSales({user,params:{id:reversible.body.id}},reversed);assert.equal(reversed.statusCode,200,JSON.stringify(reversed.body));assert.equal(reversed.body.status,'reversed');assert.equal(reversed.body.invoice_type,'NON_GST');
   assert.equal((await client.query('SELECT quantity FROM inventory_balances WHERE store_id=$1 AND product_id=$2',[stores[0].id,products[0].id])).rows[0].quantity,'91.0000');
-  // GSTIN prevents an unregistered declaration from enabling Non-GST billing.
+  // Non-GST mode saves without changing the registered declaration or stored GSTIN.
   await client.query("UPDATE stores SET gstin='10JNEPD0678B1ZL' WHERE id=$1",[stores[1].id]);
-  assert.equal((await invoke(putInvoiceSettings,stores[1],{invoiceType:'NON_GST',registrationStatus:'UNREGISTERED'})).statusCode,422);
+  const simple=await invoke(putInvoiceSettings,stores[1],{billingMode:'NON_GST'});assert.equal(simple.statusCode,200);assert.equal(simple.body.data.registrationStatus,'REGISTERED');assert.equal(simple.body.data.gstin,'10JNEPD0678B1ZL');assert.equal(simple.body.data.invoiceLayout,'SIMPLE_LAYOUT');
+  assert.equal((await invoke(getInvoiceSettings,stores[1])).body.data.billingMode,'NON_GST');
+  assert.equal((await invoke(putInvoiceSettings,stores[1],{billingMode:'bogus'})).statusCode,400);
   await client.query('UPDATE user_store_assignments SET is_active=FALSE WHERE user_id=$1 AND store_id=$2',[user.id,stores[1].id]);
   assert.equal((await invoke(getInvoiceSettings,stores[1])).statusCode,403);
   assert.ok((await client.query('SELECT count(*)::int n FROM invoice_settings_audit WHERE store_id=$1',[stores[0].id])).rows[0].n>=4);

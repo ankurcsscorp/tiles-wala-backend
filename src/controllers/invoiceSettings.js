@@ -1,48 +1,46 @@
+import {hasPermission} from '../services/permissions.js';
 import {INVOICE_LAYOUTS,DOCUMENT_TYPES,documentWarning,documentOptions} from "../services/invoicePolicy.js";
 import { connection } from "../../connection.js";
 import { canAccessStore, canManageStore } from "./stores.js";
+import {normalizeInvoicePaymentDetails} from '../services/invoicePaymentDetails.js';
 
 const hasStoredTaxId = settings => [settings.gstin, settings.tax_id].some(value => String(value ?? '').trim().length > 0);
 
-export function taxTreatmentWarning(settings) {
-  if (settings.invoice_type !== "NON_GST") return null;
-  if (hasStoredTaxId(settings))
-    return "Non-GST billing is blocked because this store has a GSTIN or tax ID saved. Keep GST Invoice selected. If those details are inaccurate, an administrator must correct them in Stores. Choose an eligible tax document in Invoice Settings; appearance can still be Simple Layout.";
-  if (settings.gst_registration_status === "REGISTERED")
-    return "Non-GST billing is not supported for a store declared as GST registered. Choose an eligible tax document in Invoice Settings; appearance can still be Simple Layout.";
-  if (settings.gst_registration_status !== "UNREGISTERED")
-    return "Confirm the actual business GST registration status before saving Non-GST Invoice. Select Unregistered only if the business is unregistered; a format selection does not establish a tax exemption.";
-  return null;
-}
 export async function readInvoiceSettings(db, id, lock = false) {
-  const r = await db.query(`SELECT s.id AS store_id,s.gstin,s.tax_id,
-    COALESCE(c.invoice_type,'GST') AS invoice_type, s.state,
-    COALESCE(c.invoice_layout,'STANDARD_GST_LAYOUT') AS invoice_layout,
-    COALESCE(c.default_document_type,'GST_TAX_INVOICE') AS default_document_type,
+  const r = await db.query(`SELECT s.id AS store_id,s.gstin,s.tax_id,s.terms_and_conditions,s.invoice_payment_details,
+    COALESCE(c.invoice_type,'NON_GST') AS invoice_type, s.state,
+    COALESCE(c.invoice_layout,'SIMPLE_LAYOUT') AS invoice_layout,
+    COALESCE(c.default_document_type,'NON_GST_COMMERCIAL') AS default_document_type,
     COALESCE(c.gst_registration_category,'UNKNOWN') AS gst_registration_category,COALESCE(c.gst_registration_status,'UNKNOWN') AS gst_registration_status
     FROM stores s LEFT JOIN store_billing_config c ON c.store_id=s.id WHERE s.id=$1 AND s.is_active=TRUE ${lock ? "FOR SHARE OF s" : ""}`, [id]);
   return r.rows[0];
 }
 const output = (s, canEdit) => ({success:true,data:{storeId:s.store_id,invoiceType:s.invoice_type,
-  billingMode:s.invoice_layout==='SIMPLE_LAYOUT'?'SIMPLE':'GST',invoiceLayout:s.invoice_layout,defaultDocumentType:s.default_document_type,
+  billingMode:s.default_document_type==='NON_GST_COMMERCIAL'?'NON_GST':'GST',invoiceLayout:s.invoice_layout,defaultDocumentType:s.default_document_type,
   registrationCategory:s.gst_registration_category,state:s.state,gstin:s.gstin||s.tax_id||'',documentOptions:documentOptions(s),
-  registrationStatus:s.gst_registration_status,hasStoredTaxId:hasStoredTaxId(s),canEdit,warning:documentWarning(s,s.default_document_type)}});
+  registrationStatus:s.gst_registration_status,hasStoredTaxId:hasStoredTaxId(s),canEdit,warning:documentWarning(s,s.default_document_type),
+  termsAndConditions:s.terms_and_conditions||'',paymentDetails:s.invoice_payment_details||{}}});
 export async function getInvoiceSettings(req,res) {
   if (!/^\d+$/.test(req.params.id)) return res.status(400).json({message:"Invalid store ID"});
   try {
     if (!await canAccessStore(req.user,req.params.id)) return res.status(403).json({message:"You do not have access to this store"});
     const s = await readInvoiceSettings(connection,req.params.id);
     if (!s) return res.status(404).json({message:"Active store not found"});
-    return res.json(output(s,await canManageStore(req.user,req.params.id)));
+    return res.json(output(s,hasPermission(req.user,"invoice_settings.manage")&&await canManageStore(req.user,req.params.id)));
   } catch(e) { console.error("Invoice settings",e.message);return res.status(500).json({message:"Unable to load invoice settings"}); }
 }
 export async function putInvoiceSettings(req,res) {
-  const {invoiceType,registrationStatus,invoiceLayout,defaultDocumentType,registrationCategory} = req.body || {};
+  const {billingMode,invoiceType,registrationStatus,invoiceLayout,defaultDocumentType,registrationCategory} = req.body || {};
+  if(billingMode!==undefined&&!['GST','NON_GST'].includes(billingMode))return res.status(400).json({message:'Choose GST or Non-GST billing'});
   if (!/^\d+$/.test(req.params.id) || (invoiceType!==undefined && !["GST","NON_GST"].includes(invoiceType)) ||
     (registrationStatus !== undefined && !["UNKNOWN","REGISTERED","UNREGISTERED"].includes(registrationStatus)))
     return res.status(400).json({message:"Invalid invoice type or registration status"});
   if((invoiceLayout!==undefined&&!INVOICE_LAYOUTS.includes(invoiceLayout)) || (defaultDocumentType!==undefined&&!DOCUMENT_TYPES.includes(defaultDocumentType)) ||
     (registrationCategory!==undefined&&!['UNKNOWN','REGULAR','COMPOSITION'].includes(registrationCategory)))return res.status(400).json({message:'Invalid layout, document type, or registration category'});
+  const {termsAndConditions,paymentDetails}=req.body||{};
+  let normalizedPayment;
+  if(termsAndConditions!==undefined && (typeof termsAndConditions!=='string'||termsAndConditions.length>10000))return res.status(400).json({message:'Terms and conditions must be text of at most 10,000 characters.'});
+  if(paymentDetails!==undefined)try{normalizedPayment=normalizeInvoicePaymentDetails(paymentDetails);}catch(e){return res.status(400).json({message:e.message});}
   const c = await connection.connect();
   try {
     await c.query("BEGIN");
@@ -52,17 +50,24 @@ export async function putInvoiceSettings(req,res) {
     const previous = await readInvoiceSettings(c,req.params.id);
     if (!previous) {await c.query("ROLLBACK");return res.status(404).json({message:"Active store not found"});}
     // Legacy invoiceType requests retain their tax meaning. Appearance-only requests never change it.
-    const documentType=defaultDocumentType ?? (invoiceType===undefined?previous.default_document_type:invoiceType==='GST'?'GST_TAX_INVOICE':'NON_GST_COMMERCIAL');
-    const next = {...previous,invoice_layout:invoiceLayout??previous.invoice_layout,
+    const documentType=billingMode!==undefined?(billingMode==='GST'?'GST_TAX_INVOICE':'NON_GST_COMMERCIAL'):defaultDocumentType ?? (invoiceType===undefined?previous.default_document_type:invoiceType==='GST'?'GST_TAX_INVOICE':'NON_GST_COMMERCIAL');
+    const next = {...previous,invoice_layout:billingMode!==undefined?(billingMode==='GST'?'STANDARD_GST_LAYOUT':'SIMPLE_LAYOUT'):invoiceLayout??previous.invoice_layout,
       default_document_type:documentType,invoice_type:documentType==='NON_GST_COMMERCIAL'?'NON_GST':'GST',
       gst_registration_status:registrationStatus??previous.gst_registration_status,
       gst_registration_category:registrationCategory??previous.gst_registration_category};
-    const taxChanged=documentType!==previous.default_document_type || registrationStatus!==undefined || registrationCategory!==undefined || invoiceType!==undefined;
+    if(termsAndConditions!==undefined)next.terms_and_conditions=termsAndConditions.trim();
+    if(normalizedPayment!==undefined)next.invoice_payment_details=normalizedPayment;
+    const taxChanged=billingMode!==undefined || documentType!==previous.default_document_type || registrationStatus!==undefined || registrationCategory!==undefined || invoiceType!==undefined;
     const warning=taxChanged?documentWarning(next,documentType):null;
     if(warning){await c.query('ROLLBACK');return res.status(422).json({message:warning});}
     await c.query(`INSERT INTO store_billing_config(store_id,invoice_type,invoice_layout,default_document_type,gst_registration_status,gst_registration_category,invoice_settings_updated_at,invoice_settings_updated_by)
       VALUES($1,$2,$3,$4,$5,$6,now(),$7) ON CONFLICT(store_id) DO UPDATE SET invoice_type=$2,invoice_layout=$3,default_document_type=$4,gst_registration_status=$5,gst_registration_category=$6,invoice_settings_updated_at=now(),invoice_settings_updated_by=$7`,
       [req.params.id,next.invoice_type,next.invoice_layout,documentType,next.gst_registration_status,next.gst_registration_category,req.user.id]);
+    if(termsAndConditions!==undefined) {
+      await c.query('UPDATE stores SET terms_and_conditions=$2,updated_at=now() WHERE id=$1',[req.params.id,next.terms_and_conditions||null]);
+      await c.query('UPDATE store_billing_config SET terms_and_conditions=$2,updated_at=now() WHERE store_id=$1',[req.params.id,next.terms_and_conditions||null]);
+    }
+    if(normalizedPayment!==undefined)await c.query('UPDATE stores SET invoice_payment_details=$2,updated_at=now() WHERE id=$1',[req.params.id,normalizedPayment]);
     await c.query("INSERT INTO invoice_settings_audit(store_id,changed_by,previous_settings,new_settings) VALUES($1,$2,$3,$4)",[req.params.id,req.user.id,previous,next]);
     await c.query("COMMIT");return res.json(output(next,true));
   } catch(e) {await c.query("ROLLBACK").catch(()=>{});console.error("Invoice settings",e.message);return res.status(500).json({message:"Unable to save invoice settings"});}

@@ -1,3 +1,4 @@
+import {effectivePermissions} from '../services/permissions.js';
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -51,6 +52,7 @@ const toPublicUser = (row) => ({
   userType: row.user_type,
   areaLocation: row.area_location ?? null,
   createdAt: row.created_at,
+  permissions: effectivePermissions(row.user_type,row.role_permissions,row.permission_overrides),
 });
 
 const createToken = (user) =>
@@ -151,7 +153,7 @@ export const signup = async (req, res) => {
     const result = await connection.query(
       `INSERT INTO users (name, mobile, password_hash, user_type, area_location)
        VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, name, mobile, user_type, area_location, created_at`,
+       RETURNING id, name, mobile, user_type, area_location, created_at,is_active,permission_overrides,(SELECT permissions FROM role_permission_settings WHERE user_type=users.user_type) AS role_permissions`,
       [
         name.trim(),
         mobile,
@@ -196,7 +198,7 @@ export const login = async (req, res) => {
 
   try {
     const result = await connection.query(
-      `SELECT id, name, mobile, user_type, area_location, password_hash, created_at
+      `SELECT id, name, mobile, user_type, area_location, password_hash, created_at,is_active,permission_overrides,(SELECT permissions FROM role_permission_settings WHERE user_type=users.user_type) AS role_permissions
        FROM users
        WHERE mobile = $1`,
       [mobile]
@@ -207,7 +209,7 @@ export const login = async (req, res) => {
       row?.password_hash ?? DUMMY_PASSWORD_HASH
     );
 
-    if (!row || !passwordMatches) {
+    if (!row || !passwordMatches || row.is_active===false) {
       return res.status(401).json({ message: "Invalid mobile number or password" });
     }
 

@@ -67,12 +67,12 @@ export async function processSalesInvoiceBonus(client, invoiceId, actorId) {
 }
 
 export async function adjustInvoiceBonusForReturn(client, returnId, actorId) {
-  const result = await client.query(`SELECT r.store_id,r.sales_invoice_id,ri.id AS return_item_id,ri.sales_invoice_item_id,ri.quantity,
+  const result = await client.query(`SELECT r.store_id,li.sales_invoice_id,ri.id AS return_item_id,ri.sales_invoice_item_id,ri.quantity,
       li.quantity AS invoice_quantity,bi.sales_bonus_record_id,bi.user_bonus
     FROM sales_returns r JOIN sales_return_items ri ON ri.sales_return_id=r.id
     JOIN sales_invoice_items li ON li.id=ri.sales_invoice_item_id
     JOIN sales_bonus_record_items bi ON bi.source_sales_invoice_item_id=li.id
-    JOIN sales_bonus_records br ON br.id=bi.sales_bonus_record_id AND br.source_sales_invoice_id=r.sales_invoice_id
+    JOIN sales_bonus_records br ON br.id=bi.sales_bonus_record_id AND br.source_sales_invoice_id=li.sales_invoice_id
     WHERE r.id=$1 AND r.status='posted'`, [returnId]);
   for (const row of result.rows) {
     const amount = await client.query("SELECT -round($1::numeric*$2::numeric/$3::numeric,2)::numeric(12,2) AS amount", [row.user_bonus,row.quantity,row.invoice_quantity]);

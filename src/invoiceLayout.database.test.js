@@ -21,9 +21,9 @@ test('appearance stays independent while GST, commercial invoices, and Bills of 
   const settings=async(fn,index,body)=>{const r=response();await fn({user,params:{id:stores[index].id},body},r);return r;};
   // Match the reported case: a stored GSTIN, unknown declaration, appearance-only PATCH through PUT.
   let saved=await settings(putInvoiceSettings,0,{invoiceLayout:'SIMPLE_LAYOUT'});assert.equal(saved.statusCode,200,JSON.stringify(saved.body));
-  assert.equal(saved.body.data.registrationStatus,'UNKNOWN');assert.equal(saved.body.data.gstin,'10JNEPD0678B1ZL');assert.equal(saved.body.data.defaultDocumentType,'GST_TAX_INVOICE');
-  const reloaded=await settings(getInvoiceSettings,0);assert.equal(reloaded.body.data.invoiceLayout,'SIMPLE_LAYOUT');assert.equal((await settings(getInvoiceSettings,1)).body.data.invoiceLayout,'STANDARD_GST_LAYOUT');
-  saved=await settings(putInvoiceSettings,0,{registrationStatus:'REGISTERED',registrationCategory:'REGULAR'});assert.equal(saved.statusCode,200);
+  assert.equal(saved.body.data.registrationStatus,'UNKNOWN');assert.equal(saved.body.data.gstin,'10JNEPD0678B1ZL');assert.equal(saved.body.data.defaultDocumentType,'NON_GST_COMMERCIAL');
+  const reloaded=await settings(getInvoiceSettings,0);assert.equal(reloaded.body.data.invoiceLayout,'SIMPLE_LAYOUT');assert.equal((await settings(getInvoiceSettings,1)).body.data.invoiceLayout,'SIMPLE_LAYOUT');
+  saved=await settings(putInvoiceSettings,0,{registrationStatus:'REGISTERED',registrationCategory:'REGULAR',defaultDocumentType:'GST_TAX_INVOICE'});assert.equal(saved.statusCode,200);
   const u=(await c.query("INSERT INTO units_of_measure(code,name) VALUES($1,'Box') RETURNING id",['L'+suffix])).rows[0];
   const p=(await c.query("INSERT INTO products(sku,name,base_unit_id,tax_rate,hsn_code,gst_supply_classification) VALUES($1,'Layout Tile',$2,18,'6907','TAXABLE') RETURNING id",['L'+suffix,u.id])).rows[0];
   await c.query("INSERT INTO stock_movements(store_id,product_id,movement_type,quantity_delta,source_type,source_id,source_line_id,idempotency_key,created_by) VALUES($1,$2,'adjustment',100,'layout_test',1,1,$3,$4)",[stores[0].id,p.id,suffix,user.id]);
@@ -33,7 +33,8 @@ test('appearance stays independent while GST, commercial invoices, and Bills of 
   let draft=await create(body);assert.equal(draft.statusCode,201,JSON.stringify(draft.body));assert.equal(draft.body.total,'236.00');assert.equal(draft.body.tax_total,'36.00');assert.equal(draft.body.items[0].tax_rate,'18.0000');
   const posted=await post(draft.body.id);assert.equal(posted.statusCode,200,JSON.stringify(posted.body));assert.equal(posted.body.cgst_total,'18.00');assert.equal(posted.body.sgst_total,'18.00');
   const original=JSON.stringify(posted.body);
-  saved=await settings(putInvoiceSettings,0,{defaultDocumentType:'NON_GST_COMMERCIAL'});assert.equal(saved.statusCode,422);assert.match(saved.body.message,/unregistered business/);
+  saved=await settings(putInvoiceSettings,0,{defaultDocumentType:'NON_GST_COMMERCIAL'});assert.equal(saved.statusCode,200);
+  await settings(putInvoiceSettings,0,{defaultDocumentType:'GST_TAX_INVOICE'});
   saved=await settings(putInvoiceSettings,1,{invoiceLayout:'SIMPLE_LAYOUT',defaultDocumentType:'NON_GST_COMMERCIAL',registrationStatus:'UNREGISTERED'});assert.equal(saved.statusCode,200);
   const commercial=await create({...body,storeId:String(stores[1].id),documentType:'NON_GST_COMMERCIAL',items:[{...body.items[0],taxRate:null}]});assert.equal(commercial.statusCode,201,JSON.stringify(commercial.body));assert.equal(commercial.body.total,'200.00');assert.equal(commercial.body.tax_total,'0.00');
   assert.equal((await settings(getInvoiceSettings,0)).body.data.defaultDocumentType,'GST_TAX_INVOICE');

@@ -1,5 +1,6 @@
+import {requirePermission,requireAnyPermission} from '../middleware/permissions.js';
 import express from "express";
-import { requireAuth, requireUserTypes } from "../middleware/auth.js";
+import { requireAuth } from "../middleware/auth.js";
 import {
   createProduct, getProduct, getProductConversions, getProductPrice, listCategories,
   listProducts, listUnits, saveCategory, saveUnit, setCategoryActive,
@@ -7,22 +8,22 @@ import {
 } from "../controllers/products.js";
 
 const router=express.Router();
-router.use(requireAuth);
+router.use(requireAuth,(req,res,next)=>req.method==='GET'?requireAnyPermission('products.view','sales.view','purchases.view','inventory.view','transfers.view','returns.view')(req,res,next):requirePermission('products','manage')(req,res,next));
 router.get("/categories",listCategories);
-router.post("/categories",requireUserTypes("Admin"),saveCategory);
-router.put("/categories/:id",requireUserTypes("Admin"),saveCategory);
-router.patch("/categories/:id/status",requireUserTypes("Admin"),setCategoryActive);
+router.post("/categories",requirePermission('products','manage'),saveCategory);
+router.put("/categories/:id",requirePermission('products','manage'),saveCategory);
+router.patch("/categories/:id/status",requirePermission('products','manage'),setCategoryActive);
 router.get("/units",listUnits);
-router.post("/units",requireUserTypes("Admin"),saveUnit);
-router.put("/units/:id",requireUserTypes("Admin"),saveUnit);
-router.patch("/units/:id/status",requireUserTypes("Admin"),setUnitActive);
+router.post("/units",requirePermission('products','manage'),saveUnit);
+router.put("/units/:id",requirePermission('products','manage'),saveUnit);
+router.patch("/units/:id/status",requirePermission('products','manage'),setUnitActive);
 router.get("/search",listProducts);
 router.get("/",listProducts);
-router.post("/",requireUserTypes("Admin"),createProduct);
+router.post("/",requirePermission('products','manage'),createProduct);
 router.get("/:id/price",getProductPrice);
 router.get("/:id/conversions",getProductConversions);
-router.patch("/:id/status",requireUserTypes("Admin"),setProductActive);
+router.patch("/:id/status",requirePermission('products','manage'),setProductActive);
 router.get("/:id",getProduct);
-router.put("/:id",requireUserTypes("Admin"),updateProduct);
+router.put("/:id",requirePermission('products','manage'),updateProduct);
 
 export default router;

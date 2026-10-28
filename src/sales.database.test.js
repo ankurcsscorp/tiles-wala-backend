@@ -22,7 +22,7 @@ test('sales drafts finalize with configured prefixes, dated numbering, payment a
     const user = (await client.query("INSERT INTO users(name,mobile,password_hash,user_type) VALUES('Sales API Test',$1,'test-only','Salesperson') RETURNING id,name,user_type", [suffix])).rows[0];
     user.userType = user.user_type;
     const store = (await client.query("INSERT INTO stores(code,name,state,gstin) VALUES($1,'Sales API Test','Bihar','10JNEPD0678B1ZL') RETURNING id", [`S${suffix}`])).rows[0];
-    await client.query("INSERT INTO store_billing_config(store_id,invoice_prefix,gst_registration_status,gst_registration_category) VALUES($1,'BILL','REGISTERED','REGULAR')", [store.id]);
+    await client.query("INSERT INTO store_billing_config(store_id,invoice_prefix,gst_registration_status,gst_registration_category,invoice_type,invoice_layout,default_document_type) VALUES($1,'BILL','REGISTERED','REGULAR','GST','STANDARD_GST_LAYOUT','GST_TAX_INVOICE')", [store.id]);
     await client.query("INSERT INTO user_store_assignments(user_id,store_id,role) VALUES($1,$2,'staff')", [user.id, store.id]);
     const customer = (await client.query("INSERT INTO customers(name,state) VALUES('Sales API Test Customer','Bihar') RETURNING id")).rows[0];
     const unit = (await client.query("INSERT INTO units_of_measure(code,name) VALUES($1,'Test unit') RETURNING id", [`U${suffix}`])).rows[0];

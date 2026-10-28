@@ -1,9 +1,10 @@
+import {requirePermission} from '../middleware/permissions.js';
 import express from "express";
 import { requireAuth,requireUserTypes } from "../middleware/auth.js";
 import { allocatePayment,createCustomerReceipt,createSupplierPayment,dailyCollections,eligibleInvoices,getPayment,invoicePaymentHistory,listPaymentMethods,listPayments,partyPaymentHistory,reversePayment,savePaymentMethod,setPaymentMethodStatus } from "../controllers/payments.js";
 
 const router=express.Router();
-router.use(requireAuth,requireUserTypes("Admin","Salesperson"));
+router.use(requireAuth,(req,res,next)=>req.method==='GET'&&req.path==='/methods'?next():requirePermission('payments')(req,res,next));
 router.get("/methods",listPaymentMethods);
 router.post("/methods",requireUserTypes("Admin"),savePaymentMethod);
 router.patch("/methods/:code/status",requireUserTypes("Admin"),setPaymentMethodStatus);

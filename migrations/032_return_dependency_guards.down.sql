@@ -1,0 +1,5 @@
+DROP TRIGGER purchase_receipt_return_dependencies ON purchase_receipts;
+DROP FUNCTION guard_receipt_return_dependencies();
+DROP TRIGGER purchase_invoice_return_dependencies ON purchase_invoices;
+DROP TRIGGER sales_invoice_return_dependencies ON sales_invoices;
+DROP FUNCTION guard_invoice_return_dependencies();

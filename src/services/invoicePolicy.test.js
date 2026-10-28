@@ -6,11 +6,11 @@ const registered={gstin:'10JNEPD0678B1ZL',gst_registration_status:'REGISTERED',g
 test('regular, composition, and unregistered documents have distinct eligibility',()=>{
  assert.equal(documentWarning(registered,'GST_TAX_INVOICE'),null);
  assert.equal(documentWarning(registered,'BILL_OF_SUPPLY'),null);
- assert.match(documentWarning(registered,'NON_GST_COMMERCIAL'),/unregistered business/);
+ assert.equal(documentWarning(registered,'NON_GST_COMMERCIAL'),null);
  assert.match(documentWarning({...registered,gst_registration_category:'COMPOSITION'},'GST_TAX_INVOICE'),/Composition/);
  assert.equal(documentWarning({...registered,gst_registration_category:'COMPOSITION'},'BILL_OF_SUPPLY'),null);
  assert.equal(documentWarning({gst_registration_status:'UNREGISTERED'},'NON_GST_COMMERCIAL'),null);
- assert.match(documentWarning({gst_registration_status:'UNKNOWN'},'NON_GST_COMMERCIAL'),/explicit Unregistered/);
+ assert.equal(documentWarning({gst_registration_status:'UNKNOWN'},'NON_GST_COMMERCIAL'),null);
 });
 test('browser and server use the same document policy',async()=>{
  const backend=await readFile(new URL('./invoicePolicy.js',import.meta.url),'utf8');
@@ -41,15 +41,12 @@ test('genuine Bill of Supply classification, references, and composition jurisdi
  assert.equal(resolveSalesDocumentType({store:composition,requestedDocumentType:'BILL_OF_SUPPLY',products:[exempt],supplyDetails:{placeOfSupply:'Bihar'}}).invoiceType,null);
  assert.equal(resolveSalesDocumentType({store:{gst_registration_status:'UNREGISTERED'},requestedDocumentType:'NON_GST_COMMERCIAL',products:[{gst_supply_classification:'UNKNOWN'}]}).invoiceType,'NON_GST');
 });
-test('new sales resolve an incompatible default from products, but explicit document requests never convert',()=>{
- const store={...registered,invoice_layout:'SIMPLE_LAYOUT',default_document_type:'BILL_OF_SUPPLY'};
- const product={id:43,name:'Costa Blue',hsn_code:'657854',tax_rate:'18.0000',gst_supply_classification:'UNKNOWN'};
- const result=resolveSalesDocumentType({store,products:[product]});
- assert.equal(result.documentType,'GST_TAX_INVOICE');assert.ok(result.reason);assert.equal(store.default_document_type,'BILL_OF_SUPPLY');assert.equal(product.gst_supply_classification,'UNKNOWN');
- assert.throws(()=>resolveSalesDocumentType({store,products:[product],requestedDocumentType:'BILL_OF_SUPPLY'}),e=>e.code==='PRODUCT_TAX_CLASSIFICATION_REQUIRED');
- for(const rate of [null,'0'])assert.throws(()=>resolveSalesDocumentType({store,products:[{...product,tax_rate:rate}]}),e=>e.code==='PRODUCT_TAX_CLASSIFICATION_REQUIRED');
- const exempt={...product,gst_supply_classification:'EXEMPT',gst_classification_reference:'Reviewed reference'};
- assert.equal(resolveSalesDocumentType({store,products:[exempt]}).documentType,'BILL_OF_SUPPLY');
- assert.throws(()=>resolveSalesDocumentType({store,products:[product,exempt]}),e=>e.code==='PRODUCT_TAX_CLASSIFICATION_REQUIRED');
- assert.throws(()=>resolveSalesDocumentType({store:{...store,gst_registration_category:'COMPOSITION'},products:[product],supplyDetails:{placeOfSupply:'Bihar'}}));
+test('Non-GST ignores product GST setup and GST never falls back to another document',()=>{
+ const product={id:43,name:'Costa Blue',tax_rate:null,gst_supply_classification:'UNKNOWN'};
+ const store={...registered,default_document_type:'NON_GST_COMMERCIAL'};
+ assert.equal(resolveSalesDocumentType({store,products:[product]}).invoiceType,'NON_GST');
+ assert.equal(resolveSalesDocumentType({store,products:[{...product,tax_rate:18,gst_supply_classification:'EXEMPT'}]}).invoiceType,'NON_GST');
+ assert.throws(()=>resolveSalesDocumentType({store:{...store,default_document_type:'GST_TAX_INVOICE'},products:[product]}),e=>e.code==='PRODUCT_TAX_RATE_REQUIRED');
+ assert.throws(()=>resolveSalesDocumentType({store:{default_document_type:'GST_TAX_INVOICE'},products:[product]}),e=>e.field==='documentType');
+ assert.throws(()=>resolveSalesDocumentType({store:{...store,default_document_type:'BILL_OF_SUPPLY'},products:[{...product,tax_rate:18}]}),e=>e.code==='PRODUCT_TAX_CLASSIFICATION_REQUIRED');
 });

@@ -78,8 +78,12 @@ const ledgerSql=`WITH entries AS (
    AND p.amount>COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='out'),0)
  UNION ALL
  SELECT pi.supplier_id,pr.store_id,pr.return_date,'purchase_return',pr.return_number,pr.total,0::numeric
- FROM purchase_returns pr JOIN purchase_invoices pi ON pi.id=pr.purchase_invoice_id
+ FROM purchase_return_accounting pr JOIN purchase_invoices pi ON pi.id=pr.purchase_invoice_id
  WHERE pi.supplier_id=$1 AND pr.status='posted' AND pr.store_id=ANY($2::bigint[])
+ UNION ALL
+ SELECT pi.supplier_id,pr.store_id,COALESCE(pr.refund_payment_date,pr.return_date),'supplier_refund',COALESCE(pr.refund_payment_number,pr.return_number),0::numeric,pr.refund_amount
+ FROM purchase_return_accounting pr JOIN purchase_invoices pi ON pi.id=pr.purchase_invoice_id
+ WHERE pi.supplier_id=$1 AND pr.status='posted' AND pr.refund_amount>0 AND pr.store_id=ANY($2::bigint[])
  UNION ALL
  SELECT a.supplier_id,a.store_id,a.adjustment_date,a.adjustment_type,'Adjustment #'||a.id,
  CASE WHEN a.direction='debit' THEN a.amount ELSE 0 END,CASE WHEN a.direction='credit' THEN a.amount ELSE 0 END
@@ -105,7 +109,7 @@ export async function listSuppliers(req,res) {
     const outstanding=`COALESCE((SELECT sum(pi.total) FROM purchase_invoices pi WHERE pi.supplier_id=s.id AND pi.store_id=ANY(${storeParam}::bigint[]) AND pi.status='posted'),0)
       -COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id JOIN purchase_invoices pi ON pi.id=pa.purchase_invoice_id WHERE pi.supplier_id=s.id AND pa.store_id=ANY(${storeParam}::bigint[]) AND pa.direction='out' AND p.status='posted' AND pi.status='posted'),0)
       -COALESCE((SELECT sum(GREATEST(p.amount-COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='out'),0),0)) FROM payments p WHERE p.supplier_id=s.id AND p.store_id=ANY(${storeParam}::bigint[]) AND p.direction='out' AND p.status='posted'),0)
-      -COALESCE((SELECT sum(pr.total) FROM purchase_returns pr JOIN purchase_invoices pi ON pi.id=pr.purchase_invoice_id WHERE pi.supplier_id=s.id AND pr.store_id=ANY(${storeParam}::bigint[]) AND pr.status='posted'),0)
+      -COALESCE((SELECT sum(pr.supplier_credit) FROM purchase_return_accounting pr JOIN purchase_invoices pi ON pi.id=pr.purchase_invoice_id WHERE pi.supplier_id=s.id AND pr.store_id=ANY(${storeParam}::bigint[]) AND pr.status='posted'),0)
       +COALESCE((SELECT sum(CASE WHEN a.direction='credit' THEN a.amount ELSE -a.amount END) FROM supplier_balance_adjustments a WHERE a.supplier_id=s.id AND a.store_id=ANY(${storeParam}::bigint[]) AND a.status='posted'),0)`;
     const result=await connection.query(`SELECT ${projection},(${outstanding})::numeric(18,2) AS outstanding_balance FROM suppliers s ${whereSql} ORDER BY s.name,s.id LIMIT $${params.length+2} OFFSET $${params.length+3}`,[...params,stores,limit,(page-1)*limit]);
     res.json({items:result.rows,pagination:{page,limit,total:count.rows[0].total,totalPages:Math.ceil(count.rows[0].total/limit)}});
@@ -159,7 +163,7 @@ async function supplierScope(req,res) {
 }
 
 export async function getSupplierInvoices(req,res) {
-  try{const stores=await supplierScope(req,res);if(!stores)return;const result=await connection.query(`SELECT pi.id,pi.store_id,s.name AS store_name,s.code AS store_code,pi.series,pi.invoice_number,pi.supplier_invoice_number,pi.invoice_date,pi.due_date,pi.subtotal,pi.discount_total,pi.tax_total,pi.total,pi.status,COALESCE(paid.amount,0)::numeric(18,2) AS allocated_payments,COALESCE(ret.amount,0)::numeric(18,2) AS returns,(pi.total-COALESCE(paid.amount,0)-COALESCE(ret.amount,0))::numeric(18,2) AS outstanding_balance FROM purchase_invoices pi JOIN stores s ON s.id=pi.store_id LEFT JOIN LATERAL(SELECT sum(pa.amount) amount FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id WHERE pa.purchase_invoice_id=pi.id AND p.status='posted') paid ON TRUE LEFT JOIN LATERAL(SELECT sum(total) amount FROM purchase_returns WHERE purchase_invoice_id=pi.id AND status='posted') ret ON TRUE WHERE pi.supplier_id=$1 AND pi.store_id=ANY($2::bigint[]) AND pi.status='posted' ORDER BY pi.invoice_date DESC,pi.id DESC`,[req.params.id,stores]);res.json(result.rows);}
+  try{const stores=await supplierScope(req,res);if(!stores)return;const result=await connection.query(`SELECT pi.id,pi.store_id,s.name AS store_name,s.code AS store_code,pi.series,pi.invoice_number,pi.supplier_invoice_number,pi.invoice_date,pi.due_date,pi.subtotal,pi.discount_total,pi.tax_total,pi.total,pi.status,COALESCE(paid.amount,0)::numeric(18,2) AS allocated_payments,COALESCE(ret.amount,0)::numeric(18,2) AS returns,(pi.total-COALESCE(paid.amount,0)-COALESCE(ret.amount,0))::numeric(18,2) AS outstanding_balance FROM purchase_invoices pi JOIN stores s ON s.id=pi.store_id LEFT JOIN LATERAL(SELECT sum(pa.amount) amount FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id WHERE pa.purchase_invoice_id=pi.id AND p.status='posted') paid ON TRUE LEFT JOIN LATERAL(SELECT sum(total) amount FROM purchase_invoice_return_credits WHERE purchase_invoice_id=pi.id AND status='posted') ret ON TRUE WHERE pi.supplier_id=$1 AND pi.store_id=ANY($2::bigint[]) AND pi.status='posted' ORDER BY pi.invoice_date DESC,pi.id DESC`,[req.params.id,stores]);res.json(result.rows);}
   catch(error){console.error("Unable to load supplier invoices:",error.message);res.status(500).json({message:"Unable to load supplier invoices"});}
 }
 

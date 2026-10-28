@@ -1,19 +1,16 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {taxTreatmentWarning} from './invoiceSettings.js';
-
-test('Non-GST validation explains a saved registration identifier even when the declaration is unregistered',()=>{
- for(const field of ['gstin','tax_id']){
-  assert.match(taxTreatmentWarning({invoice_type:'NON_GST',gst_registration_status:'UNREGISTERED',[field]:'10JNEPD0678B1ZL'}),/GSTIN or tax ID saved/);
+import {documentWarning} from '../services/invoicePolicy.js';
+test('Non-GST requires no declaration or identifiers to be cleared',()=>{
+ for(const status of ['UNKNOWN','REGISTERED','UNREGISTERED'])for(const gstin of [null,'10JNEPD0678B1ZL','invalid']){
+  const store={invoice_type:'NON_GST',gst_registration_status:status,gstin};
+  assert.equal(documentWarning(store,'NON_GST_COMMERCIAL'),null);
  }
 });
-test('Non-GST validation identifies unknown and registered declarations separately',()=>{
- assert.match(taxTreatmentWarning({invoice_type:'NON_GST',gst_registration_status:'UNKNOWN'}),/Confirm the actual business/);
- assert.match(taxTreatmentWarning({invoice_type:'NON_GST',gst_registration_status:'REGISTERED'}),/declared as GST registered/);
-});
-test('blank identifiers follow the same treatment as database posting checks',()=>{
- assert.equal(taxTreatmentWarning({invoice_type:'NON_GST',gst_registration_status:'UNREGISTERED',gstin:'  ',tax_id:null}),null);
-});
-test('GST settings do not invoke Non-GST restrictions',()=>{
- assert.equal(taxTreatmentWarning({invoice_type:'GST',gst_registration_status:'UNKNOWN',gstin:'10JNEPD0678B1ZL'}),null);
+test('GST still requires valid identifiers, actual registration and regular category',()=>{
+ assert.match(documentWarning({},'GST_TAX_INVOICE'),/valid store GSTIN/);
+ const store={gstin:'10JNEPD0678B1ZL'};
+ assert.match(documentWarning(store,'GST_TAX_INVOICE'),/Registered declaration/);
+ assert.match(documentWarning({...store,gst_registration_status:'REGISTERED'},'GST_TAX_INVOICE'),/Regular registration category/);
+ assert.equal(documentWarning({...store,gst_registration_status:'REGISTERED',gst_registration_category:'REGULAR'},'GST_TAX_INVOICE'),null);
 });

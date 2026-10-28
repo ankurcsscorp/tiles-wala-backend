@@ -76,11 +76,11 @@ const balanceSql = `WITH entries AS (
    AND p.amount>COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='in'),0)
  UNION ALL
  SELECT si.customer_id,sr.store_id,sr.return_date,'sales_return',sr.return_number,0::numeric,sr.total
- FROM sales_returns sr JOIN sales_invoices si ON si.id=sr.sales_invoice_id
+ FROM sales_return_accounting sr JOIN sales_invoices si ON si.id=sr.sales_invoice_id
  WHERE si.customer_id=$1 AND sr.status='posted' AND sr.store_id=ANY($2::bigint[])
  UNION ALL
- SELECT si.customer_id,sr.store_id,sr.return_date,'sales_return_refund',sr.return_number,sr.refund_amount,0::numeric
- FROM sales_returns sr JOIN sales_invoices si ON si.id=sr.sales_invoice_id
+ SELECT si.customer_id,sr.store_id,COALESCE(sr.refund_payment_date,sr.return_date),'sales_return_refund',COALESCE(sr.refund_payment_number,sr.return_number),sr.refund_amount,0::numeric
+ FROM sales_return_accounting sr JOIN sales_invoices si ON si.id=sr.sales_invoice_id
  WHERE si.customer_id=$1 AND sr.status='posted' AND sr.refund_amount>0 AND sr.store_id=ANY($2::bigint[])
  UNION ALL
  SELECT a.customer_id,a.store_id,a.adjustment_date,a.adjustment_type,'Adjustment #'||a.id,
@@ -109,7 +109,7 @@ export async function listCustomers(req, res) {
       COALESCE((SELECT sum(si.total) FROM sales_invoices si WHERE si.customer_id=c.id AND si.store_id=ANY(${storeParam}::bigint[]) AND si.status='posted'),0)
       - COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id JOIN sales_invoices si ON si.id=pa.sales_invoice_id WHERE si.customer_id=c.id AND pa.store_id=ANY(${storeParam}::bigint[]) AND pa.direction='in' AND p.status='posted' AND si.status='posted'),0)
       - COALESCE((SELECT sum(GREATEST(p.amount-COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='in'),0),0)) FROM payments p WHERE p.customer_id=c.id AND p.store_id=ANY(${storeParam}::bigint[]) AND p.direction='in' AND p.status='posted'),0)
-      - COALESCE((SELECT sum(sr.customer_credit) FROM sales_returns sr JOIN sales_invoices si ON si.id=sr.sales_invoice_id WHERE si.customer_id=c.id AND sr.store_id=ANY(${storeParam}::bigint[]) AND sr.status='posted'),0)
+      - COALESCE((SELECT sum(sr.customer_credit) FROM sales_return_accounting sr JOIN sales_invoices si ON si.id=sr.sales_invoice_id WHERE si.customer_id=c.id AND sr.store_id=ANY(${storeParam}::bigint[]) AND sr.status='posted'),0)
       + COALESCE((SELECT sum(CASE WHEN a.direction='debit' THEN a.amount ELSE -a.amount END) FROM customer_balance_adjustments a WHERE a.customer_id=c.id AND a.store_id=ANY(${storeParam}::bigint[]) AND a.status='posted'),0)`;
     const result = await connection.query(`SELECT ${customerProjection},(${balanceParts})::numeric(18,2) AS outstanding_balance
       FROM customers c ${whereSql} ORDER BY c.name,c.id LIMIT $${params.length + 2} OFFSET $${params.length + 3}`,
@@ -191,7 +191,7 @@ async function customerAndScope(req, res) {
 }
 
 export async function getCustomerInvoices(req, res) {
-  try { const stores = await customerAndScope(req,res); if (!stores) return; const result = await connection.query(`SELECT si.id,si.store_id,s.name AS store_name,s.code AS store_code,si.series,si.invoice_number,si.invoice_date,si.due_date,si.subtotal,si.discount_total,si.tax_total,si.total,si.status,COALESCE(paid.amount,0)::numeric(18,2) AS allocated_payments,COALESCE(ret.amount,0)::numeric(18,2) AS returns,(si.total-COALESCE(paid.amount,0)-COALESCE(ret.amount,0)+COALESCE(refunds.amount,0))::numeric(18,2) AS outstanding_balance FROM sales_invoices si JOIN stores s ON s.id=si.store_id LEFT JOIN LATERAL(SELECT sum(pa.amount) amount FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id WHERE pa.sales_invoice_id=si.id AND p.status='posted') paid ON TRUE LEFT JOIN LATERAL(SELECT sum(total) amount FROM sales_returns WHERE sales_invoice_id=si.id AND status='posted') ret ON TRUE LEFT JOIN LATERAL(SELECT sum(refund_amount) amount FROM sales_returns WHERE sales_invoice_id=si.id AND status='posted') refunds ON TRUE WHERE si.customer_id=$1 AND si.store_id=ANY($2::bigint[]) AND si.status='posted' ORDER BY si.invoice_date DESC,si.id DESC`, [req.params.id,stores]); res.json(result.rows); }
+  try { const stores = await customerAndScope(req,res); if (!stores) return; const result = await connection.query(`SELECT si.id,si.store_id,s.name AS store_name,s.code AS store_code,si.series,si.invoice_number,si.invoice_date,si.due_date,si.subtotal,si.discount_total,si.tax_total,si.total,si.status,COALESCE(paid.amount,0)::numeric(18,2) AS allocated_payments,COALESCE(ret.amount,0)::numeric(18,2) AS returns,(si.total-COALESCE(paid.amount,0)-COALESCE(ret.amount,0)+COALESCE(refunds.amount,0))::numeric(18,2) AS outstanding_balance FROM sales_invoices si JOIN stores s ON s.id=si.store_id LEFT JOIN LATERAL(SELECT sum(pa.amount) amount FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id WHERE pa.sales_invoice_id=si.id AND p.status='posted') paid ON TRUE LEFT JOIN LATERAL(SELECT sum(total) amount FROM sales_invoice_return_credits WHERE sales_invoice_id=si.id AND status='posted') ret ON TRUE LEFT JOIN LATERAL(SELECT sum(refund_amount) amount FROM sales_invoice_return_credits WHERE sales_invoice_id=si.id AND status='posted') refunds ON TRUE WHERE si.customer_id=$1 AND si.store_id=ANY($2::bigint[]) AND si.status='posted' ORDER BY si.invoice_date DESC,si.id DESC`, [req.params.id,stores]); res.json(result.rows); }
   catch (error) { console.error("Unable to load customer invoices:", error.message); res.status(500).json({ message: "Unable to load customer invoices" }); }
 }
 

@@ -1,3 +1,4 @@
+import {requirePermission} from '../middleware/permissions.js';
 import express from "express";
 import {
 	createProductConfig,
@@ -17,8 +18,8 @@ router.get("/products/manage", requireAuth, requireUserTypes("Admin"), getManage
 router.post("/products", requireAuth, requireUserTypes("Admin"), createProductConfig);
 router.put("/products/:id", requireAuth, requireUserTypes("Admin"), updateProductConfig);
 router.get("/products", requireAuth, requireUserTypes("Admin"), getProductCatalog);
-router.get("/records", requireAuth, getSalesBonusRecords);
-router.get("/top-seller", requireAuth, getTopSeller);
+router.get("/records", requireAuth, requirePermission('bonus','view'), getSalesBonusRecords);
+router.get("/top-seller", requireAuth, requirePermission('bonus','view'), getTopSeller);
 router.patch("/records/:id/payment", requireAuth, requireUserTypes("Admin"), updateSalesBonusPayment);
 router.post("/records", requireAuth, requireUserTypes("Admin"), createSalesBonusRecord);
 

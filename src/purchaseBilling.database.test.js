@@ -22,8 +22,8 @@ test('shared billing mode preserves supplier GST, receipts, payments, returns, a
   }
   let createAttempt=0;
   const invoke=async(fn,params={},body={},query={})=>{if(fn===createPurchaseDraft)body={...body,supplierInvoiceNumber:`${body.supplierInvoiceNumber||'SUP'}-${++createAttempt}`};const r=response();await fn({user,params,body,query},r);return r;};
-  let result=await invoke(putInvoiceSettings,{id:stores[0].id},{invoiceLayout:'SIMPLE_LAYOUT'});assert.equal(result.statusCode,200);assert.equal(result.body.data.billingMode,'SIMPLE');assert.equal(result.body.data.registrationStatus,'UNKNOWN');
-  assert.equal((await invoke(getInvoiceSettings,{id:stores[1].id})).body.data.billingMode,'GST');
+  let result=await invoke(putInvoiceSettings,{id:stores[0].id},{invoiceLayout:'SIMPLE_LAYOUT'});assert.equal(result.statusCode,200);assert.equal(result.body.data.billingMode,'NON_GST');assert.equal(result.body.data.registrationStatus,'UNKNOWN');
+  assert.equal((await invoke(getInvoiceSettings,{id:stores[1].id})).body.data.billingMode,'NON_GST');
   const registered=(await c.query("INSERT INTO suppliers(name,tax_id,state) VALUES('Registered supplier','10JNEPD0678B1ZL','Bihar') RETURNING id")).rows[0];
   const unregistered=(await c.query("INSERT INTO suppliers(name,state) VALUES('Unregistered supplier','Bihar') RETURNING id")).rows[0];
   const unit=(await c.query("INSERT INTO units_of_measure(code,name) VALUES($1,'Piece') RETURNING id",['E'+suffix])).rows[0];
@@ -60,7 +60,8 @@ test('shared billing mode preserves supplier GST, receipts, payments, returns, a
   assert.equal((await invoke(getPurchase,{id})).body.outstanding_balance,'77.00');
   assert.equal((await c.query('SELECT quantity FROM inventory_balances WHERE store_id=$1 AND product_id=$2',[stores[0].id,product.id])).rows[0].quantity,'2.0000');
   result=await invoke(getSupplierLedger,{id:registered.id},{},{storeId:String(stores[0].id)});assert.equal(result.statusCode,200);assert.ok(result.body.some(x=>x.entry_type==='purchase_return'));assert.ok(result.body.some(x=>x.entry_type==='payment'));
-  // Tax facts come from the supplier, not the buyer's still-unknown registration.
+  // Explicit legacy GST purchase requests retain their original tax workflow.
+  await invoke(putInvoiceSettings,{id:stores[1].id},{invoiceLayout:'STANDARD_GST_LAYOUT'});
   result=await invoke(createPurchaseDraft,{}, {...base,invoiceLayout:'STANDARD_GST_LAYOUT',storeId:String(stores[1].id),supplierInvoiceNumber:'STD-'+suffix,supplierTaxJurisdiction:'INTER_STATE'});assert.equal(result.statusCode,201,JSON.stringify(result.body));assert.equal(result.body.igst_total,'36.00');assert.equal(result.body.cgst_total,'0.00');assert.equal((await invoke(postPurchaseInvoice,{id:result.body.id})).statusCode,200);
   // No-GST supplier invoices explicitly use zero without deleting product tax metadata.
   const commercial={...base,supplierId:String(unregistered.id),supplierDocumentType:'NON_GST_COMMERCIAL',supplierTaxJurisdiction:null,declaredTaxTotal:null,items:[{...base.items[0],quantity:'10',unitPrice:'850',taxRate:'0'}]};
@@ -69,7 +70,7 @@ test('shared billing mode preserves supplier GST, receipts, payments, returns, a
   assert.equal((await invoke(createPurchaseDraft,{}, {...commercial,items:base.items})).statusCode,422);
   assert.equal((await invoke(createPurchaseDraft,{}, {...commercial,declaredTaxTotal:'36'})).statusCode,422);
   assert.equal((await invoke(createPurchaseDraft,{}, {...base,declaredTaxTotal:'35'})).statusCode,422);
-  assert.equal((await invoke(createPurchaseDraft,{}, {...commercial,supplierId:String(registered.id)})).statusCode,422);
+  result=await invoke(createPurchaseDraft,{}, {...commercial,supplierId:String(registered.id)});assert.equal(result.statusCode,201,JSON.stringify(result.body));assert.equal((await invoke(postPurchaseInvoice,{id:result.body.id})).statusCode,200);
   assert.equal((await invoke(createPurchaseDraft,{}, {...base,supplierId:String(unregistered.id)})).statusCode,422);
   const bill={...commercial,supplierId:String(registered.id),supplierDocumentType:'BILL_OF_SUPPLY',supplierTaxReason:'Composition declaration on supplier invoice'};
   result=await invoke(createPurchaseDraft,{},bill);assert.equal(result.statusCode,201,JSON.stringify(result.body));assert.equal((await invoke(postPurchaseInvoice,{id:result.body.id})).statusCode,200);

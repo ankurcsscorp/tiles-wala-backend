@@ -1,9 +1,10 @@
+import {requirePermission} from '../middleware/permissions.js';
 import express from "express";
-import { requireAuth,requireUserTypes } from "../middleware/auth.js";
+import { requireAuth } from "../middleware/auth.js";
 import { cancelTransfer,createTransfer,dispatchTransfer,getTransfer,listTransfers,receiveTransfer,transferHistory,updateTransferDraft } from "../controllers/transfers.js";
 
 const router=express.Router();
-router.use(requireAuth,requireUserTypes("Admin","Salesperson"));
+router.use(requireAuth,requirePermission('transfers'));
 router.get("/",listTransfers);
 router.post("/",createTransfer);
 router.get("/:id/history",transferHistory);

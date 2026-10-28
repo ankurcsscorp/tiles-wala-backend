@@ -5,15 +5,12 @@ export const DOCUMENT_TYPES=['GST_TAX_INVOICE','BILL_OF_SUPPLY','NON_GST_COMMERC
 export const hasStoredTaxId=s=>[s.gstin,s.tax_id].some(v=>String(v??'').trim());
 export const validStoreGstin=s=>[s.gstin,s.tax_id].some(v=>!gstValidationError(v));
 export function documentWarning(s,type) {
-  if(type==='NON_GST_COMMERCIAL') {
-    if(hasStoredTaxId(s))return 'Non-GST Commercial Invoice requires an unregistered business without a saved GSTIN or tax ID. Appearance can still be Simple Layout.';
-    if(s.gst_registration_status!=='UNREGISTERED')return 'Non-GST Commercial Invoice requires an explicit Unregistered declaration.';
-    return null;
-  }
+  if(type==='NON_GST_COMMERCIAL')return null;
+
   if(!validStoreGstin(s))return 'A valid store GSTIN is required for this tax document. Update the actual business details in Stores.';
   if(s.gst_registration_status==='UNREGISTERED')return 'This document is incompatible with an Unregistered declaration.';
   if(type==='GST_TAX_INVOICE') {
-    if(s.gst_registration_status!=='REGISTERED')return 'Confirm the actual Registered declaration before issuing a GST Tax Invoice. Appearance changes can be saved independently.';
+    if(s.gst_registration_status!=='REGISTERED')return 'Confirm the actual Registered declaration before issuing a GST Tax Invoice.';
     if(s.gst_registration_category==='COMPOSITION')return 'Composition businesses must use Bill of Supply and cannot collect GST on these invoices.';
     if(s.gst_registration_category!=='REGULAR')return 'Select the actual Regular registration category before issuing a GST Tax Invoice.';
     return null;
@@ -59,25 +56,11 @@ function validateSalesDocumentType({store,products=[],supplyDetails={},requested
     }
     if(type==='GST_TAX_INVOICE'){
       if(['EXEMPT','NON_TAXABLE'].includes(classification))throw policyError('DOCUMENT_NOT_ELIGIBLE',`${label} is exempt or non-taxable and requires a separate Bill of Supply. Mixed-document supplies are not supported.`,details);
-      if(requireTaxRate&&(p.tax_rate===null||p.tax_rate===undefined||p.tax_rate===''))throw policyError('PRODUCT_TAX_RATE_REQUIRED',`${label} needs its applicable GST rate configured in Products before issuing a GST Tax Invoice. Simple Billing does not establish a zero tax rate.`,details);
+      if(requireTaxRate&&(p.tax_rate===null||p.tax_rate===undefined||p.tax_rate===''))throw policyError('PRODUCT_TAX_RATE_REQUIRED',`${label} needs its applicable GST rate configured in Products before issuing a GST Tax Invoice.`,details);
     }
   });
   return {documentType:type,invoiceType:documentInvoiceType(type)};
 }
 
-// For a NEW sale only, an incompatible default is a preference, not a document request.
-// Resolve only when exactly one alternative passes the full transaction policy.
-export function resolveSalesDocumentType(args){
-  try{return validateSalesDocumentType(args);}
-  catch(error){
-    if(args.requestedDocumentType!==undefined||!args.products?.length)throw error;
-    const eligible=DOCUMENT_TYPES.flatMap(type=>{
-      // An unclassified zero rate is insufficient evidence to auto-select a tax treatment.
-      if(type==='GST_TAX_INVOICE'&&args.products.some(p=>(!p.gst_supply_classification||p.gst_supply_classification==='UNKNOWN')&&!(Number(p.tax_rate)>0)))return [];
-      try{return [validateSalesDocumentType({...args,requestedDocumentType:type})];}catch{return [];}
-    });
-    if(eligible.length!==1)throw error;
-    return {...eligible[0],defaultDocumentType:normalizeSalesStore(args.store).default_document_type,
-      reason:'The saved default is not eligible for these products. This new sale uses the only eligible tax document; billing appearance and store defaults stay unchanged.'};
-  }
-}
+// The selected mode/document is authoritative; never fall back from GST to a zero-tax document.
+export function resolveSalesDocumentType(args){return validateSalesDocumentType(args);}

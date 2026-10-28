@@ -1,5 +1,6 @@
+import {requirePermission} from '../middleware/permissions.js';
 import express from "express";
-import { requireAuth, requireUserTypes } from "../middleware/auth.js";
+import { requireAuth } from "../middleware/auth.js";
 import {
   createPurchaseDraft, listPurchases, getPurchase, getPurchaseItems, updatePurchaseDraft,
   postPurchaseInvoice, cancelPurchase, reversePurchase, receivePurchaseGoods,
@@ -8,9 +9,9 @@ import {
 } from "../controllers/purchases.js";
 
 const router=express.Router();
-router.use(requireAuth,requireUserTypes("Admin","Salesperson"));
+router.use(requireAuth,requirePermission('purchases'));
 router.get("/reports",purchaseReports);
-router.post("/payments",recordSupplierPayment);
+router.post("/payments",requirePermission("payments","manage"),recordSupplierPayment);
 router.get("/",listPurchases);
 router.post("/",createPurchaseDraft);
 router.get("/:id/items",getPurchaseItems);

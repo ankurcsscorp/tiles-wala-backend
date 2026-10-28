@@ -1,12 +1,13 @@
+import {requirePermission} from '../middleware/permissions.js';
 import express from "express";
-import { requireAuth, requireUserTypes } from "../middleware/auth.js";
+import { requireAuth } from "../middleware/auth.js";
 import {
   inventoryList, inventorySummary, productStock, movementHistory,
   lowStock, valuation, reconciliation, createAdjustment,
 } from "../controllers/inventory.js";
 
 const router = express.Router();
-router.use(requireAuth, requireUserTypes("Admin", "Salesperson"));
+router.use(requireAuth, requirePermission('inventory'));
 router.get("/", inventoryList);
 router.get("/summary", inventorySummary);
 router.get("/low-stock", lowStock);
@@ -14,5 +15,5 @@ router.get("/valuation", valuation);
 router.get("/reconciliation", reconciliation);
 router.get("/movements", movementHistory);
 router.get("/products/:productId", productStock);
-router.post("/adjustments", requireUserTypes("Admin", "Salesperson"), createAdjustment);
+router.post("/adjustments", requirePermission('inventory'), createAdjustment);
 export default router;

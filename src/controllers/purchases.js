@@ -18,7 +18,7 @@ const invoiceFields=`pi.id,pi.store_id,st.code AS store_code,st.name AS store_na
   CASE WHEN pi.status<>'posted' THEN 'unposted' WHEN COALESCE(pa.amount,0)>=pi.total-COALESCE(pr.ret_total,0) THEN 'paid' WHEN COALESCE(pa.amount,0)>0 THEN 'partially_paid' ELSE 'unpaid' END AS payment_status`;
 const invoiceJoins=`FROM purchase_invoices pi JOIN stores st ON st.id=pi.store_id JOIN suppliers su ON su.id=pi.supplier_id
   LEFT JOIN LATERAL(SELECT SUM(pax.amount) AS amount FROM payment_allocations pax JOIN payments pay ON pay.id=pax.payment_id AND pay.status='posted' WHERE pax.purchase_invoice_id=pi.id AND pax.direction='out') pa ON TRUE
-  LEFT JOIN LATERAL(SELECT SUM(total) AS ret_total FROM purchase_returns WHERE purchase_invoice_id=pi.id AND status='posted') pr ON TRUE`;
+  LEFT JOIN LATERAL(SELECT SUM(total) AS ret_total FROM purchase_invoice_return_credits WHERE purchase_invoice_id=pi.id AND status='posted') pr ON TRUE`;
 
 function checkDecimal(value,label,{nullable=false,scale=4,signed=false}={}){
   if((value===undefined||value===null||value==="")&&nullable)return null;
@@ -149,7 +149,8 @@ export async function createPurchaseDraft(req,res){
     const supplier=await client.query("SELECT id FROM suppliers WHERE id=$1 AND is_active=TRUE",[data.supplierId]);if(!supplier.rowCount)throw Object.assign(new Error("Active supplier not found"),{status:400});
     const settings=await readInvoiceSettings(client,data.storeId,true);data.invoiceLayout=settings.invoice_layout;
     if(req.body.invoiceLayout&&req.body.invoiceLayout!==data.invoiceLayout)throw Object.assign(new Error('Store billing preference changed. Reopen the purchase editor.'),{status:409});
-    if(!data.supplierDocumentType)throw Object.assign(new Error('Choose the actual supplier invoice tax document; the store billing mode does not determine supplier GST.'),{status:422});
+    if(!data.supplierDocumentType&&settings.default_document_type==='NON_GST_COMMERCIAL')data.supplierDocumentType='NON_GST_COMMERCIAL';
+    if(!data.supplierDocumentType)throw Object.assign(new Error('Choose the supplier invoice tax document for GST Billing.'),{status:422});
     await validateSupplierTaxFacts(client,data);
     const store=storeResult.rows[0];const series=(store.invoice_prefix||store.code||"PUR").toUpperCase();
     const period=store.invoice_numbering_period==="monthly"?data.invoiceDate.slice(0,7):store.invoice_numbering_period==="never"?"all":data.invoiceDate.slice(0,4);
@@ -245,6 +246,7 @@ export async function reverseGoodsReceipt(req,res){
   const client=await connection.connect();
   try{
     await client.query("BEGIN");
+    await client.query("SELECT id FROM purchase_invoices WHERE id=$1 FOR UPDATE",[req.params.id]);
     const result=await client.query("SELECT id,status,store_id FROM purchase_receipts WHERE id=$1 AND purchase_invoice_id=$2 FOR UPDATE",[req.params.receiptId,req.params.id]);
     if(!result.rowCount){await client.query("ROLLBACK");return res.status(404).json({message:"Goods receipt not found"});}
     const receipt=result.rows[0];if(!await storeAuthorized(req,res,receipt.store_id)){await client.query("ROLLBACK");return;}if(!await canManageStore(req.user,receipt.store_id,["owner","manager","inventory"],client)){await client.query("ROLLBACK");return res.status(403).json({message:"Inventory manager authorization is required to reverse a goods receipt"});}
@@ -261,8 +263,9 @@ async function changePurchaseStatus(req,res,status){
     if(!await canManageStore(req.user,invoice.store_id,["owner","manager"],client)){await client.query("ROLLBACK");return res.status(403).json({message:"Manager authorization is required to reverse a posted purchase invoice"});}
     if(invoice.status!=="posted"){await client.query("ROLLBACK");return res.status(409).json({message:"Only posted invoices can be reversed"});}
     const dependencies=await client.query(`SELECT EXISTS(SELECT 1 FROM purchase_receipts WHERE purchase_invoice_id=$1 AND status='posted') AS has_receipts,
-      EXISTS(SELECT 1 FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id WHERE pa.purchase_invoice_id=$1 AND p.status='posted') AS has_payments`,[req.params.id]);
-    if(dependencies.rows[0].has_receipts||dependencies.rows[0].has_payments){await client.query("ROLLBACK");return res.status(409).json({message:"Reverse posted goods receipts and supplier payments before reversing the purchase invoice"});}
+      EXISTS(SELECT 1 FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id WHERE pa.purchase_invoice_id=$1 AND p.status='posted') AS has_payments,
+      (EXISTS(SELECT 1 FROM purchase_returns WHERE purchase_invoice_id=$1 AND status='posted') OR EXISTS(SELECT 1 FROM purchase_invoice_return_credits WHERE purchase_invoice_id=$1 AND status='posted')) AS has_returns`,[req.params.id]);
+    if(dependencies.rows[0].has_receipts||dependencies.rows[0].has_payments||dependencies.rows[0].has_returns){await client.query("ROLLBACK");return res.status(409).json({message:"Reverse related returns, goods receipts and supplier payments before reversing the purchase invoice"});}
   }
   await client.query("UPDATE purchase_invoices SET status=$2,updated_at=now() WHERE id=$1",[req.params.id,status]);await client.query("INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id) VALUES($1,$2,$3,'purchase_invoice',$4)",[invoice.store_id,req.user.id,`purchase.invoice.${status}`,req.params.id]);await client.query("COMMIT");return res.json(await loadPurchase(req.params.id));
   }catch(error){await client.query("ROLLBACK").catch(()=>{});return respondDbError(res,error,"Unable to change purchase invoice status");}finally{client.release();}
@@ -286,7 +289,7 @@ export async function recordSupplierPayment(req,res){
     const locked=await client.query(`SELECT id,store_id,supplier_id,status,total FROM purchase_invoices WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE`,[allocationIds]);if(locked.rowCount!==allocationIds.length)throw Object.assign(new Error("One or more purchase invoices were not found"),{status:404});
     let allocationTotal="0.00";
     for(const allocation of allocations){const invoice=locked.rows.find((row)=>String(row.id)===String(allocation.invoiceId));if(String(invoice.store_id)!==String(storeId)||String(invoice.supplier_id)!==String(supplierId)||invoice.status!=="posted")throw Object.assign(new Error("Payments can only be allocated to posted invoices for this supplier and store"),{status:400});const value=checkDecimal(allocation.amount,"Allocation amount",{scale:2});if(typeof value!=="string"||value.includes(" must be a valid ")||Number(value)<=0)throw Object.assign(new Error("Each allocation must be a positive amount with two decimal places"),{status:400});allocation.amount=value;
-      const due=await client.query(`SELECT GREATEST(pi.total-COALESCE((SELECT SUM(pa.amount) FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.status='posted' WHERE pa.purchase_invoice_id=pi.id),0)-COALESCE((SELECT SUM(total) FROM purchase_returns WHERE purchase_invoice_id=pi.id AND status='posted'),0),0)::NUMERIC(18,2) AS due FROM purchase_invoices pi WHERE pi.id=$1`,[invoice.id]);
+      const due=await client.query(`SELECT GREATEST(pi.total-COALESCE((SELECT SUM(pa.amount) FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.status='posted' WHERE pa.purchase_invoice_id=pi.id),0)-COALESCE((SELECT SUM(total) FROM purchase_invoice_return_credits WHERE purchase_invoice_id=pi.id AND status='posted'),0),0)::NUMERIC(18,2) AS due FROM purchase_invoices pi WHERE pi.id=$1`,[invoice.id]);
       const valid=await client.query("SELECT $1::numeric <= $2::numeric AS fits",[value,due.rows[0].due]);if(!valid.rows[0].fits)throw Object.assign(new Error(`Payment allocation exceeds the outstanding balance on invoice ${invoice.id}`),{status:400});
       const summed=await client.query("SELECT $1::numeric+$2::numeric AS value",[allocationTotal,value]);allocationTotal=summed.rows[0].value;
     }
@@ -306,7 +309,7 @@ export async function purchaseReports(req,res){
       COALESCE(sum(COALESCE(pa.amount,0)) FILTER(WHERE pi.status='posted'),0)::numeric(18,2) AS paid_total,
       COALESCE(sum(GREATEST(pi.total-COALESCE(pa.amount,0)-COALESCE(pr.ret_total,0),0)) FILTER(WHERE pi.status='posted'),0)::numeric(18,2) AS outstanding_total
       FROM purchase_invoices pi LEFT JOIN LATERAL(SELECT sum(pax.amount) amount FROM payment_allocations pax JOIN payments pay ON pay.id=pax.payment_id AND pay.status='posted' WHERE pax.purchase_invoice_id=pi.id) pa ON TRUE
-      LEFT JOIN LATERAL(SELECT sum(total) ret_total FROM purchase_returns WHERE purchase_invoice_id=pi.id AND status='posted') pr ON TRUE WHERE ${storeClause}`,values);
+      LEFT JOIN LATERAL(SELECT sum(total) ret_total FROM purchase_invoice_return_credits WHERE purchase_invoice_id=pi.id AND status='posted') pr ON TRUE WHERE ${storeClause}`,values);
     const bySupplier=await connection.query(`SELECT su.id,su.name,COUNT(*)::int AS invoice_count,COALESCE(SUM(pi.total),0)::numeric(18,2) AS purchase_total FROM purchase_invoices pi JOIN suppliers su ON su.id=pi.supplier_id WHERE ${storeClause} AND pi.status='posted' GROUP BY su.id,su.name ORDER BY purchase_total DESC`,values);
     const byStore=await connection.query(`SELECT st.id,st.code,st.name,COUNT(*)::int AS invoice_count,COALESCE(SUM(pi.total),0)::numeric(18,2) AS purchase_total FROM purchase_invoices pi JOIN stores st ON st.id=pi.store_id WHERE ${storeClause} AND pi.status='posted' GROUP BY st.id,st.code,st.name ORDER BY st.name`,values);
     return res.json({summary:summary.rows[0],bySupplier:bySupplier.rows,byStore:byStore.rows});

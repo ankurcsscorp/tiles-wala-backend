@@ -71,13 +71,14 @@ test('sales document resolution and payment finalization are atomic, authoritati
   assert.equal(fail.body.code,'INVALID_PAYMENT_AMOUNT');assert.equal(fail.body.invoiceTotal,'2856.00');
   assert.equal((await c.query('SELECT total,status FROM sales_invoices WHERE id=$1',[draft.body.id])).rows[0].total,'3009.00');
   const recalculated=await call(finalizeSales,{},draft.body.id);assert.equal(recalculated.statusCode,200);assert.equal(recalculated.body.total,'2856.00');
-  // Reproduce the screenshot: a Bill of Supply default, UNKNOWN classification, configured GST rate.
+  // Non-GST is authoritative regardless of saved GSTIN, UNKNOWN classification, or product tax rate.
+  await c.query("UPDATE store_billing_config SET invoice_type='NON_GST',default_document_type='NON_GST_COMMERCIAL' WHERE store_id=$1",[store.id]);
   await c.query("UPDATE products SET gst_supply_classification='UNKNOWN',tax_rate=18 WHERE id=$1",[product.id]);
   draft=await call(createSalesDraft,body);assert.equal(draft.statusCode,201,JSON.stringify(draft.body));
-  assert.equal(draft.body.document_type,'GST_TAX_INVOICE');assert.equal(draft.body.invoice_layout,'SIMPLE_LAYOUT');assert.equal(draft.body.total,'3009.00');
+  assert.equal(draft.body.document_type,'NON_GST_COMMERCIAL');assert.equal(draft.body.invoice_layout,'SIMPLE_LAYOUT');assert.equal(draft.body.total,'2550.00');assert.equal(draft.body.tax_total,'0.00');
   assert.equal((await call(finalizeSales,{},draft.body.id)).statusCode,200);
   const explicitBill=await call(createSalesDraft,{...body,documentType:'BILL_OF_SUPPLY'});assert.equal(explicitBill.body.code,'PRODUCT_TAX_CLASSIFICATION_REQUIRED');
-  assert.equal((await c.query('SELECT default_document_type FROM store_billing_config WHERE store_id=$1',[store.id])).rows[0].default_document_type,'BILL_OF_SUPPLY');
+  assert.equal((await c.query('SELECT default_document_type FROM store_billing_config WHERE store_id=$1',[store.id])).rows[0].default_document_type,'NON_GST_COMMERCIAL');
   const unregistered=(await c.query("INSERT INTO stores(code,name,state) VALUES($1,'Unregistered Finalize','Bihar') RETURNING id",['N'+suffix])).rows[0];
   await c.query("INSERT INTO store_billing_config(store_id,invoice_layout,default_document_type,gst_registration_status) VALUES($1,'SIMPLE_LAYOUT','NON_GST_COMMERCIAL','UNREGISTERED')",[unregistered.id]);
   await c.query("INSERT INTO stock_movements(store_id,product_id,movement_type,quantity_delta,source_type,source_id,source_line_id,idempotency_key,created_by) VALUES($1,$2,'adjustment',10,'finalize_test',2,1,$3,$4)",[unregistered.id,product.id,'N'+suffix,user.id]);

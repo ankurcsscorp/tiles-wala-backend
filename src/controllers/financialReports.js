@@ -1,3 +1,5 @@
+import {entriesSql,buildLedger} from '../services/partyLedger.js';
+import {ledgerHtml,ledgerPdf,ledgerFilename} from '../services/ledgerDocument.js';
 import { connection } from "../../connection.js";
 
 const isAdmin=req=>req.user?.userType?.toLowerCase()==="admin";
@@ -13,60 +15,26 @@ async function storesFor(req,res,requested){
   return ids;
 }
 
-function entriesSql(type){
- if(type==="customer")return `SELECT si.customer_id AS party_id,si.store_id,si.invoice_date AS entry_date,'sales_invoice'::text AS entry_type,si.invoice_number AS reference,si.id AS source_id,'sales_invoice'::text AS source_type,si.total AS debit,0::numeric AS credit
-  FROM sales_invoices si WHERE si.customer_id=$1 AND si.status='posted' AND si.store_id=ANY($2::bigint[])
- UNION ALL SELECT si.customer_id,pa.store_id,p.payment_date,'customer_receipt',p.payment_number,p.id,'payment',0::numeric,sum(pa.amount)
-  FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.direction='in' AND p.status='posted' AND p.store_id=pa.store_id
-  JOIN sales_invoices si ON si.id=pa.sales_invoice_id AND si.customer_id=$1 AND si.status='posted' WHERE pa.direction='in' AND pa.store_id=ANY($2::bigint[]) GROUP BY si.customer_id,pa.store_id,p.payment_date,p.payment_number,p.id
- UNION ALL SELECT p.customer_id,p.store_id,p.payment_date,'customer_receipt_advance',p.payment_number,p.id,'payment',0::numeric,GREATEST(p.amount-COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='in'),0),0)
-  FROM payments p WHERE p.customer_id=$1 AND p.direction='in' AND p.status='posted' AND p.store_id=ANY($2::bigint[]) AND p.amount>COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='in'),0)
- UNION ALL SELECT si.customer_id,r.store_id,r.return_date,'sales_credit_note',r.return_number,r.id,'sales_return',0::numeric,r.customer_credit
-  FROM sales_returns r JOIN sales_invoices si ON si.id=r.sales_invoice_id WHERE si.customer_id=$1 AND r.status='posted' AND r.store_id=ANY($2::bigint[])
- UNION ALL SELECT si.customer_id,r.store_id,r.return_date,'customer_refund',r.return_number,r.id,'sales_return',r.refund_amount,0::numeric
-  FROM sales_returns r JOIN sales_invoices si ON si.id=r.sales_invoice_id WHERE si.customer_id=$1 AND r.status='posted' AND r.refund_amount>0 AND r.store_id=ANY($2::bigint[])
- UNION ALL SELECT a.customer_id,a.store_id,a.adjustment_date,a.adjustment_type,'Adjustment #'||a.id,a.id,'customer_adjustment',CASE WHEN a.direction='debit' THEN a.amount ELSE 0 END,CASE WHEN a.direction='credit' THEN a.amount ELSE 0 END
-  FROM customer_balance_adjustments a WHERE a.customer_id=$1 AND a.status='posted' AND a.store_id=ANY($2::bigint[])`;
- return `SELECT pi.supplier_id AS party_id,pi.store_id,pi.invoice_date AS entry_date,'purchase_invoice'::text AS entry_type,pi.invoice_number AS reference,pi.id AS source_id,'purchase_invoice'::text AS source_type,0::numeric AS debit,pi.total AS credit
-  FROM purchase_invoices pi WHERE pi.supplier_id=$1 AND pi.status='posted' AND pi.store_id=ANY($2::bigint[])
- UNION ALL SELECT pi.supplier_id,pa.store_id,p.payment_date,'supplier_payment',p.payment_number,p.id,'payment',sum(pa.amount),0::numeric
-  FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.direction='out' AND p.status='posted' AND p.store_id=pa.store_id
-  JOIN purchase_invoices pi ON pi.id=pa.purchase_invoice_id AND pi.supplier_id=$1 AND pi.status='posted' WHERE pa.direction='out' AND pa.store_id=ANY($2::bigint[]) GROUP BY pi.supplier_id,pa.store_id,p.payment_date,p.payment_number,p.id
- UNION ALL SELECT p.supplier_id,p.store_id,p.payment_date,'supplier_payment_advance',p.payment_number,p.id,'payment',GREATEST(p.amount-COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='out'),0),0),0::numeric
-  FROM payments p WHERE p.supplier_id=$1 AND p.direction='out' AND p.status='posted' AND p.store_id=ANY($2::bigint[]) AND p.amount>COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='out'),0)
- UNION ALL SELECT pi.supplier_id,r.store_id,r.return_date,'purchase_debit_note',r.return_number,r.id,'purchase_return',r.supplier_credit,0::numeric
-  FROM purchase_returns r JOIN purchase_invoices pi ON pi.id=r.purchase_invoice_id WHERE pi.supplier_id=$1 AND r.status='posted' AND r.store_id=ANY($2::bigint[])
- UNION ALL SELECT a.supplier_id,a.store_id,a.adjustment_date,a.adjustment_type,'Adjustment #'||a.id,a.id,'supplier_adjustment',CASE WHEN a.direction='debit' THEN a.amount ELSE 0 END,CASE WHEN a.direction='credit' THEN a.amount ELSE 0 END
-  FROM supplier_balance_adjustments a WHERE a.supplier_id=$1 AND a.status='posted' AND a.store_id=ANY($2::bigint[])`;
-}
+
 const signExpr=type=>type==="customer"?"debit-credit":"credit-debit";
 const pageLimit=req=>{const limit=Number.parseInt(req.query.limit,10)||50,offset=Number.parseInt(req.query.offset,10)||0;return Number.isInteger(limit)&&limit>0&&limit<=200&&Number.isInteger(offset)&&offset>=0?{limit,offset}:null;};
 const error=(res,e,label)=>{if(["23503","23514","22007","22P02"].includes(e.code))return res.status(400).json({message:e.message});console.error(label,e.message);return res.status(500).json({message:label});};
 
-export async function partyLedger(req,res){
- const {partyType,id}=req.params;if(!partyTypeOk(partyType)||!idOk(id))return res.status(400).json({message:"Choose a customer or supplier and a valid ID"});
- const {limit,offset}=pageLimit(req)||{};if(!limit)return res.status(400).json({message:"Limit must be 1 to 200 and offset cannot be negative"});
- const from=req.query.fromDate||null,to=req.query.toDate||null;if(!dateOk(from)||!dateOk(to)||(from&&to&&from>to))return res.status(400).json({message:"Use a valid date range with fromDate before toDate"});
- try{
-  const stores=await storesFor(req,res,req.query.storeId);if(!stores)return;if(!stores.length)return res.json({items:[],pagination:{limit,offset,total:0},openingBalance:"0.00",closingBalance:"0.00",stores:[]});
-  const table=partyType==="customer"?"customers":"suppliers",exists=await connection.query(`SELECT id FROM ${table} WHERE id=$1`,[id]);if(!exists.rowCount)return res.status(404).json({message:`${partyType} not found`});
-  const entries=entriesSql(partyType),sign=signExpr(partyType);
-  const bounds=await connection.query(`WITH entries AS (${entries}) SELECT store_id,
-    COALESCE(sum(${sign}) FILTER(WHERE $3::date IS NOT NULL AND entry_date<$3::date),0)::numeric(18,2) AS opening_balance,
-    COALESCE(sum(${sign}) FILTER(WHERE entry_date<=COALESCE($4::date,CURRENT_DATE)),0)::numeric(18,2) AS closing_balance
-    FROM entries GROUP BY store_id ORDER BY store_id`,[id,stores,from,to]);
-  const totals=await connection.query(`WITH entries AS (${entries}) SELECT
-    COALESCE(sum(${sign}) FILTER(WHERE $3::date IS NOT NULL AND entry_date<$3::date),0)::numeric(18,2) AS opening_balance,
-    COALESCE(sum(${sign}) FILTER(WHERE entry_date<=COALESCE($4::date,CURRENT_DATE)),0)::numeric(18,2) AS closing_balance FROM entries`,[id,stores,from,to]);
-  const where=["entry_date <= COALESCE($4::date,CURRENT_DATE)"],params=[id,stores,from,to];if(from)where.push("entry_date >= $3::date");if(to)where[0]="entry_date <= $4::date";
-  const count=await connection.query(`WITH entries AS (${entries}) SELECT count(*)::int AS total FROM entries WHERE ${where.join(" AND ")}`,params);
-  const rows=await connection.query(`WITH entries AS (${entries}),running AS (
-    SELECT e.*,sum(${sign}) OVER(PARTITION BY store_id ORDER BY entry_date,entry_type,source_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)::numeric(18,2) AS running_balance FROM entries e)
-    SELECT r.*,s.name AS store_name,s.code AS store_code FROM running r JOIN stores s ON s.id=r.store_id WHERE ${where.join(" AND ")}
-    ORDER BY entry_date,store_id,entry_type,source_id LIMIT $${params.length+1} OFFSET $${params.length+2}`,[...params,limit,offset]);
-  return res.json({partyType,partyId:id,openingBalance:totals.rows[0].opening_balance,closingBalance:totals.rows[0].closing_balance,stores:bounds.rows,items:rows.rows,pagination:{limit,offset,total:count.rows[0].total}});
- }catch(e){return error(res,e,"Unable to load financial ledger");}
+async function ledgerRequest(req,res,{complete=false}={}){
+ const {partyType,id}=req.params;
+ if(!partyTypeOk(partyType)||!idOk(id)){res.status(400).json({message:'Choose a customer or supplier and a valid ID'});return null;}
+ const from=req.query.fromDate||null,to=req.query.toDate||null;
+ if(!dateOk(from)||!dateOk(to)||(from&&to&&from>to)){res.status(400).json({message:'Use a valid date range with fromDate before toDate'});return null;}
+ const paging=pageLimit(req);if(!complete&&!paging){res.status(400).json({message:'Limit must be 1 to 200 and offset cannot be negative'});return null;}
+ const stores=await storesFor(req,res,req.query.storeId);if(!stores)return null;
+ const client=await connection.connect();
+ try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');const report=await buildLedger(client,{partyType,id,stores,from,to,complete,...paging});await client.query('COMMIT');return report;}
+ catch(e){await client.query('ROLLBACK').catch(()=>{});throw e;}finally{client.release();}
 }
+export async function partyLedger(req,res){try{const report=await ledgerRequest(req,res);if(report){res.set?.('Cache-Control','private, no-store');return res.json(report);}}catch(e){return ledgerError(res,e,'Unable to load financial ledger');}}
+export async function printLedger(req,res){try{const report=await ledgerRequest(req,res,{complete:true});if(report){res.set('Cache-Control','private, no-store');return res.type('html').send(ledgerHtml(report));}}catch(e){return ledgerError(res,e,'Unable to prepare ledger printing');}}
+export async function downloadLedgerPdf(req,res){try{const report=await ledgerRequest(req,res,{complete:true});if(!report)return;const pdf=await ledgerPdf(report);res.set('Cache-Control','private, no-store');res.set('Content-Disposition','attachment; filename="'+ledgerFilename(report)+'.pdf"');return res.type('application/pdf').send(pdf);}catch(e){return ledgerError(res,e,'Unable to generate ledger PDF');}}
+function ledgerError(res,e,label){if(e.status)return res.status(e.status).json({message:e.message});return error(res,e,label);}
 
 export async function outstandingReport(req,res){
  const type=req.query.partyType;if(!partyTypeOk(type))return res.status(400).json({message:"partyType must be customer or supplier"});const {limit,offset}=pageLimit(req)||{};if(!limit)return res.status(400).json({message:"Limit must be 1 to 200 and offset cannot be negative"});
@@ -83,15 +51,15 @@ export async function outstandingReport(req,res){
  }catch(e){return error(res,e,"Unable to create outstanding report");}
 }
 
-const businessCustomerEntries=`SELECT si.customer_id AS party_id,si.store_id,si.invoice_date AS entry_date,si.total AS debit,0::numeric AS credit FROM sales_invoices si WHERE si.status='posted'
+export const businessCustomerEntries=`SELECT si.customer_id AS party_id,si.store_id,si.invoice_date AS entry_date,si.total AS debit,0::numeric AS credit FROM sales_invoices si WHERE si.status='posted'
  UNION ALL SELECT si.customer_id,si.store_id,p.payment_date,0::numeric,pa.amount FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.status='posted' AND p.direction='in' JOIN sales_invoices si ON si.id=pa.sales_invoice_id AND si.status='posted' WHERE pa.direction='in'
  UNION ALL SELECT p.customer_id,p.store_id,p.payment_date,0::numeric,GREATEST(p.amount-COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='in'),0),0) FROM payments p WHERE p.direction='in' AND p.status='posted' AND p.customer_id IS NOT NULL
- UNION ALL SELECT si.customer_id,r.store_id,r.return_date,r.refund_amount,r.customer_credit FROM sales_returns r JOIN sales_invoices si ON si.id=r.sales_invoice_id WHERE r.status='posted'
+ UNION ALL SELECT si.customer_id,r.store_id,r.return_date,r.refund_amount,r.total FROM sales_return_accounting r JOIN sales_invoices si ON si.id=r.sales_invoice_id WHERE r.status='posted'
  UNION ALL SELECT a.customer_id,a.store_id,a.adjustment_date,CASE WHEN a.direction='debit' THEN a.amount ELSE 0 END,CASE WHEN a.direction='credit' THEN a.amount ELSE 0 END FROM customer_balance_adjustments a WHERE a.status='posted'`;
-const businessSupplierEntries=`SELECT pi.supplier_id AS party_id,pi.store_id,pi.invoice_date AS entry_date,0::numeric AS debit,pi.total AS credit FROM purchase_invoices pi WHERE pi.status='posted'
+export const businessSupplierEntries=`SELECT pi.supplier_id AS party_id,pi.store_id,pi.invoice_date AS entry_date,0::numeric AS debit,pi.total AS credit FROM purchase_invoices pi WHERE pi.status='posted'
  UNION ALL SELECT pi.supplier_id,pi.store_id,p.payment_date,pa.amount,0::numeric FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.status='posted' AND p.direction='out' JOIN purchase_invoices pi ON pi.id=pa.purchase_invoice_id AND pi.status='posted' WHERE pa.direction='out'
  UNION ALL SELECT p.supplier_id,p.store_id,p.payment_date,GREATEST(p.amount-COALESCE((SELECT sum(pa.amount) FROM payment_allocations pa WHERE pa.payment_id=p.id AND pa.direction='out'),0),0),0::numeric FROM payments p WHERE p.direction='out' AND p.status='posted' AND p.supplier_id IS NOT NULL
- UNION ALL SELECT pi.supplier_id,r.store_id,r.return_date,r.supplier_credit,0::numeric FROM purchase_returns r JOIN purchase_invoices pi ON pi.id=r.purchase_invoice_id WHERE r.status='posted'
+ UNION ALL SELECT pi.supplier_id,r.store_id,r.return_date,r.supplier_credit,0::numeric FROM purchase_return_accounting r JOIN purchase_invoices pi ON pi.id=r.purchase_invoice_id WHERE r.status='posted'
  UNION ALL SELECT a.supplier_id,a.store_id,a.adjustment_date,CASE WHEN a.direction='debit' THEN a.amount ELSE 0 END,CASE WHEN a.direction='credit' THEN a.amount ELSE 0 END FROM supplier_balance_adjustments a WHERE a.status='posted'`;
 
 export async function outstandingSummary(req,res){
@@ -106,7 +74,7 @@ export async function outstandingSummary(req,res){
 export async function agingReport(req,res){
  const type=req.query.partyType;if(!partyTypeOk(type))return res.status(400).json({message:"partyType must be customer or supplier"});const {limit,offset}=pageLimit(req)||{};if(!limit)return res.status(400).json({message:"Limit must be 1 to 200 and offset cannot be negative"});const asOf=req.query.asOfDate||new Date().toISOString().slice(0,10);if(!dateOk(asOf))return res.status(400).json({message:"asOfDate must use YYYY-MM-DD"});
  try{const stores=await storesFor(req,res,req.query.storeId);if(!stores)return;if(!stores.length)return res.json({items:[],summary:{},pagination:{limit,offset,total:0},dateBasis:"due_date"});
-  const customer=type==="customer",invoice=customer?"sales_invoices":"purchase_invoices",party=customer?"customers":"suppliers",partyId=customer?"customer_id":"supplier_id",returnTable=customer?"sales_returns":"purchase_returns",returnKey=customer?"sales_invoice_id":"purchase_invoice_id",returnAmount=customer?"customer_credit":"supplier_credit",direction=customer?"in":"out";
+  const customer=type==="customer",invoice=customer?"sales_invoices":"purchase_invoices",party=customer?"customers":"suppliers",partyId=customer?"customer_id":"supplier_id",returnTable=customer?"sales_invoice_return_credits":"purchase_invoice_return_credits",returnKey=customer?"sales_invoice_id":"purchase_invoice_id",returnAmount=customer?"customer_credit":"supplier_credit",direction=customer?"in":"out";
   const rowsSql=`SELECT i.id AS invoice_id,i.store_id,i.${partyId} AS party_id,i.series,i.invoice_number,i.invoice_date,COALESCE(i.due_date,i.invoice_date+p.payment_terms_days) AS due_date,i.total,
     GREATEST(i.total-COALESCE(a.amount,0)-COALESCE(r.amount,0),0)::numeric(18,2) AS outstanding,(($2::date-COALESCE(i.due_date,i.invoice_date+p.payment_terms_days))::int) AS overdue_days
     FROM ${invoice} i JOIN ${party} p ON p.id=i.${partyId}
@@ -135,8 +103,11 @@ export async function transactionDetails(req,res){
 
 function csvCell(value){const text=value===null||value===undefined?"":String(value);return `"${text.replaceAll('"','""')}"`;}
 export async function exportLedger(req,res){
- const {partyType,id}=req.params;if(!partyTypeOk(partyType)||!idOk(id))return res.status(400).json({message:"Choose a customer or supplier and a valid ID"});const from=req.query.fromDate||null,to=req.query.toDate||null;if(!dateOk(from)||!dateOk(to)||(from&&to&&from>to))return res.status(400).json({message:"Use a valid date range with fromDate before toDate"});
- try{const stores=await storesFor(req,res,req.query.storeId);if(!stores)return;if(!stores.length)return res.status(403).json({message:"No authorized stores are available"});const sql=entriesSql(partyType),sign=signExpr(partyType);const rows=await connection.query(`WITH entries AS (${sql}),running AS (SELECT e.*,sum(${sign}) OVER(PARTITION BY store_id ORDER BY entry_date,entry_type,source_id)::numeric(18,2) running_balance FROM entries e) SELECT r.entry_date,r.entry_type,r.reference,r.debit,r.credit,r.running_balance,s.name AS store_name FROM running r JOIN stores s ON s.id=r.store_id WHERE ($3::date IS NULL OR entry_date >= $3::date) AND entry_date<=COALESCE($4::date,CURRENT_DATE) ORDER BY entry_date,store_id,entry_type,source_id`,[id,stores,from,to]);
-  const header=["Date","Store","Type","Reference","Debit","Credit","Running balance"];const csv=[header,...rows.rows.map(row=>[row.entry_date,row.store_name,row.entry_type,row.reference,row.debit,row.credit,row.running_balance])].map(line=>line.map(csvCell).join(",")).join("\r\n");res.type("text/csv; charset=utf-8");res.set("Content-Disposition",`attachment; filename=${partyType}-${id}-ledger.csv`);return res.send(csv);
- }catch(e){return error(res,e,"Unable to export ledger");}
+ try{
+  const report=await ledgerRequest(req,res,{complete:true});if(!report)return;
+  const header=['Date','Store','Type','Reference','Debit','Credit','Running balance','Payment mode','Due date'];
+  const carried=(label,value,date)=>{const debit=String(value).startsWith('-')===(report.partyType==='supplier'),absolute=String(value).replace(/^-/,'');return [date||'',report.scope,label,'',debit?absolute:'0.00',debit?'0.00':absolute,value,'',''];};
+  const lines=[header,carried('Opening Balance',report.openingBalance,report.fromDate),...report.items.map(row=>[row.entry_date,row.store_name,row.entry_type,row.reference,row.debit,row.credit,row.running_balance,row.payment_method||'',row.due_date||'']),carried('Closing Balance',report.closingBalance,report.toDate),['','','Period totals','',report.totalDebit,report.totalCredit,'','','']];
+  const csv=lines.map(line=>line.map(csvCell).join(',')).join('\r\n');res.type('text/csv; charset=utf-8');res.set('Cache-Control','private, no-store');res.set('Content-Disposition','attachment; filename="'+ledgerFilename(report)+'.csv"');return res.send(csv);
+ }catch(e){return ledgerError(res,e,'Unable to export ledger');}
 }

@@ -1,3 +1,4 @@
+import {effectivePermissions} from '../services/permissions.js';
 import jwt from "jsonwebtoken";
 import { connection } from "../../connection.js";
 import { JWT_AUDIENCE, JWT_ISSUER } from "../controllers/auth.js";
@@ -30,14 +31,14 @@ export const requireAuth = async (req, res, next) => {
 
   try {
     const result = await connection.query(
-      `SELECT id, name, mobile, user_type
+      `SELECT id, name, mobile, user_type,is_active,permission_overrides,(SELECT permissions FROM role_permission_settings WHERE user_type=users.user_type) AS role_permissions
        FROM users
        WHERE id = $1`,
       [payload.sub]
     );
     const user = result.rows[0];
 
-    if (!user) {
+    if (!user || user.is_active===false) {
       return res.status(401).json({
         message: "Authentication token is invalid or expired",
       });
@@ -48,6 +49,7 @@ export const requireAuth = async (req, res, next) => {
       name: user.name,
       mobile: user.mobile,
       userType: user.user_type,
+      permissions:effectivePermissions(user.user_type,user.role_permissions,user.permission_overrides),
     };
     return next();
   } catch (error) {
