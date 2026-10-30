@@ -19,11 +19,11 @@ const productSelect = `p.id,p.sku,p.name,p.description,p.product_description,p.c
  p.sales_unit_id,su.code AS sales_unit_code,su.name AS sales_unit_name,
  p.default_purchase_price,p.default_selling_price,p.reorder_threshold,p.is_active,p.created_at,p.updated_at`;
 
-function validateProduct(body = {}) {
+function validateProduct(body = {}, {allowMissingSku = false} = {}) {
   const sku=text(body.sku).toUpperCase(); const name=text(body.name);
   const categoryId=positiveId(body.categoryId); const baseUnitId=positiveId(body.baseUnitId);
   const purchaseUnitId=positiveId(body.purchaseUnitId); const salesUnitId=positiveId(body.salesUnitId);
-  if (!sku || sku.length>80 || !/^[A-Z0-9][A-Z0-9._/-]*$/.test(sku)) return {error:"SKU is required and may contain letters, numbers, dots, underscores, slashes, or hyphens"};
+  if ((!sku&&!allowMissingSku) || sku.length>80 || (sku&&!/^[A-Z0-9][A-Z0-9._/-]*$/.test(sku))) return {error:"SKU may contain letters, numbers, dots, underscores, slashes, or hyphens"};
   if (!name || name.length>200) return {error:"Product name is required and must be 200 characters or fewer"};
   if (Number.isNaN(categoryId)||Number.isNaN(baseUnitId)||Number.isNaN(purchaseUnitId)||Number.isNaN(salesUnitId)) return {error:"Category and unit IDs must be valid"};
   if (!baseUnitId) return {error:"A base unit is required"};
@@ -107,13 +107,27 @@ async function saveConversions(client,productId,conversions){
   for(const conversion of conversions) await client.query("INSERT INTO product_unit_conversions(product_id,unit_id,factor_to_base) VALUES($1,$2,$3)",[productId,conversion.unitId,conversion.factor]);
 }
 
+async function nextCategorySku(client,categoryId){
+  if(!categoryId)throw Object.assign(new Error("Select a category to generate the product SKU"),{statusCode:400});
+  const category=await client.query("SELECT name FROM product_categories WHERE id=$1 FOR UPDATE",[categoryId]);
+  if(!category.rowCount)throw Object.assign(new Error("Selected category does not exist"),{statusCode:400});
+  const prefix=(category.rows[0].name.toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,70)||"CATEGORY");
+  // Serialize generators sharing a prefix (including differently named categories
+  // that normalize to the same prefix) before looking for the next available number.
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))",[prefix]);
+  const existing=await client.query("SELECT upper(sku) AS sku FROM products WHERE upper(sku) LIKE $1",[`${prefix}%`]);
+  const pattern=new RegExp(`^${prefix}(\\d+)$`);
+  const next=existing.rows.reduce((max,row)=>{const match=pattern.exec(row.sku);return match?Math.max(max,Number(match[1])):max;},0)+1;
+  return `${prefix}${String(next).padStart(3,"0")}`;
+}
+
 export async function createProduct(req,res){
-  const {data,error}=validateProduct(req.body);if(error)return res.status(400).json({message:error});
+  const {data,error}=validateProduct(req.body,{allowMissingSku:true});if(error)return res.status(400).json({message:error});
   const client=await connection.connect();
-  try{await client.query("BEGIN");const result=await client.query(`INSERT INTO products(sku,name,description,product_description,category_id,brand,collection,tile_size,finish,color,product_image_url,hsn_code,tax_rate,tax_inclusive,base_unit_id,purchase_unit_id,sales_unit_id,default_purchase_price,default_selling_price,reorder_threshold,is_active,gst_supply_classification,gst_classification_reference)
+  try{await client.query("BEGIN");if(!data.sku)data.sku=await nextCategorySku(client,data.categoryId);const result=await client.query(`INSERT INTO products(sku,name,description,product_description,category_id,brand,collection,tile_size,finish,color,product_image_url,hsn_code,tax_rate,tax_inclusive,base_unit_id,purchase_unit_id,sales_unit_id,default_purchase_price,default_selling_price,reorder_threshold,is_active,gst_supply_classification,gst_classification_reference)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING id`,[data.sku,data.name,data.description||null,data.productDescription||null,data.categoryId,data.brand||null,data.collection||null,data.tileSize||null,data.finish||null,data.color||null,data.productImageUrl||null,data.hsnCode||null,data.taxRate,data.taxInclusive,data.baseUnitId,data.purchaseUnitId,data.salesUnitId,data.defaultPurchasePrice,data.defaultSellingPrice,data.reorderThreshold,data.isActive,data.supplyClassification,data.classificationReference||null]);
     await saveConversions(client,result.rows[0].id,data.conversions);await client.query("COMMIT");return getProduct({...req,params:{id:result.rows[0].id},query:{}},res);
-  }catch(error){await client.query("ROLLBACK").catch(()=>{});if(error.code==="23505")return res.status(409).json({message:"A product with this SKU already exists"});if(error.code==="23503")return res.status(400).json({message:"Selected category or unit does not exist"});if(error.code==="23514")return res.status(400).json({message:error.message});console.error("Unable to create product:",error.message);res.status(500).json({message:"Unable to create product"});}finally{client.release();}
+  }catch(error){await client.query("ROLLBACK").catch(()=>{});if(error.statusCode)return res.status(error.statusCode).json({message:error.message});if(error.code==="23505")return res.status(409).json({message:"A product with this SKU already exists"});if(error.code==="23503")return res.status(400).json({message:"Selected category or unit does not exist"});if(error.code==="23514")return res.status(400).json({message:error.message});console.error("Unable to create product:",error.message);res.status(500).json({message:"Unable to create product"});}finally{client.release();}
 }
 
 export async function updateProduct(req,res){

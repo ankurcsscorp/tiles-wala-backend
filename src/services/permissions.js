@@ -5,6 +5,7 @@ export const PERMISSION_MODULES=[
   ['customers','Customers & ledgers',true],['suppliers','Suppliers & ledgers',true],['reports','Financial reports',false],
   ['dashboard','Dashboard',false],['products','Product management',true],['invoice_settings','Invoice settings',true],
   ['enquiries','Enquiry management',true],['collections','Collection management',true],['bonus','Own sales bonus records',false],
+  ['bonus_cost','Bonus cost and profit details',false],
 ].map(([key,label,manage])=>({key,label,manage}));
 export const PERMISSION_KEYS=PERMISSION_MODULES.flatMap(m=>[`${m.key}.view`,...(m.manage?[`${m.key}.manage`]:[])]);
 const staff=new Set(['sales','purchases','payments','returns','inventory','transfers','customers','suppliers','reports','dashboard','invoice_settings','enquiries','bonus']);

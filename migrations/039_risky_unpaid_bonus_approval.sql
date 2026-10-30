@@ -1,0 +1,3 @@
+ALTER TABLE sales_bonus_records
+  ADD COLUMN IF NOT EXISTS approval_risk BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS unpaid_invoice_amount_at_approval NUMERIC(12,2) NOT NULL DEFAULT 0;

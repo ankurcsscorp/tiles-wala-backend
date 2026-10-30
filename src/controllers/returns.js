@@ -3,7 +3,7 @@ import {connection} from '../../connection.js';
 import {canAccessStore,canManageStore} from './stores.js';
 import {hasPermission} from '../services/permissions.js';
 import * as workflow from '../services/returnInvoices.js';
-import {adjustInvoiceBonusForReturn} from './salesBonusIntegration.js';
+import {adjustInvoiceBonusForReturn,refreshInvoiceBonusPayability} from './salesBonusIntegration.js';
 const {spec,fail,idOk,validDate,authorize,sourceInvoice,sourceItems,calculate,partyBalance,invoiceBalances,permissions}=workflow;
 const error=(res,e,label)=>{if(e.status)return res.status(e.status).json({message:e.message});if(['23503','23514','22007','22003','22P02','TW001'].includes(e.code))return res.status(422).json({message:e.message});if(e.code==='23505')return res.status(409).json({message:'Duplicate return or settlement request'});console.error(label,e.message);return res.status(500).json({message:label});};
 const kindOf=req=>req.params.type||req.query.type||'sales';
@@ -118,7 +118,7 @@ export async function changeReturnStatus(req,res){return transaction(req,res,'Un
  const reason=String(req.body?.reason||'').trim();if(reason.length<3||reason.length>1000)fail('Provide a correction reason of 3 to 1000 characters',400);
  const originalLines=(await c.query(`SELECT product_id FROM ${s.items} WHERE ${s.returnKey}=$1`,[row.id])).rows;await workflow.lockReturnInventory(c,row.store_id,originalLines);
  await c.query(`UPDATE ${s.returns} SET status=$2 WHERE id=$1`,[row.id,next]);
- if(s.sales&&next==='reversed')await c.query("INSERT INTO sales_bonus_adjustments(sales_bonus_record_id,store_id,source_type,source_id,source_item_id,amount,reason,created_by) SELECT sales_bonus_record_id,store_id,'sales_return_reversal',source_id,source_item_id,-amount,'Sales return reversed',$2 FROM sales_bonus_adjustments WHERE source_type='sales_return_item' AND source_id=$1 ON CONFLICT DO NOTHING",[row.id,req.user.id]);
+ if(s.sales&&next==='reversed'){await c.query("INSERT INTO sales_bonus_adjustments(sales_bonus_record_id,store_id,source_type,source_id,source_item_id,amount,reason,created_by) SELECT sales_bonus_record_id,store_id,'sales_return_reversal',source_id,source_item_id,-amount,'Sales return reversed',$2 FROM sales_bonus_adjustments WHERE source_type='sales_return_item' AND source_id=$1 ON CONFLICT DO NOTHING",[row.id,req.user.id]);const invoices=await c.query('SELECT DISTINCT li.sales_invoice_id FROM sales_return_items ri JOIN sales_invoice_items li ON li.id=ri.sales_invoice_item_id WHERE ri.sales_return_id=$1',[row.id]);for(const invoice of invoices.rows)await refreshInvoiceBonusPayability(c,invoice.sales_invoice_id);}
  await audit(c,req.user,s,row.id,row.store_id,next,{reason});return {body:await loadRecord(c,s,row.id,req.user)};
  });}
 export async function inspectReturn(req,res){return transaction(req,res,'Unable to record return inspection',async c=>{

@@ -4,7 +4,7 @@ import { readInvoiceSettings } from "./invoiceSettings.js";
 import { randomUUID } from "node:crypto";
 import { connection } from "../../connection.js";
 import { canAccessStore, canManageStore } from "./stores.js";
-import { processSalesInvoiceBonus, reverseInvoiceBonus } from "./salesBonusIntegration.js";
+import { processSalesInvoiceBonus, quoteSalesInvoiceBonus, reverseInvoiceBonus } from "./salesBonusIntegration.js";
 
 const isAdmin=(req)=>req.user?.userType?.toLowerCase()==="admin";
 const idOk=(v)=>/^\d+$/.test(String(v??""));
@@ -12,12 +12,12 @@ const decimal=(v,label,{scale=4,signed=false}={})=>{
   const pattern=signed?new RegExp(`^-?\\d{1,14}(\\.\\d{1,${scale}})?$`):new RegExp(`^\\d{1,14}(\\.\\d{1,${scale}})?$`);
   return pattern.test(String(v??""))?String(v):`${label} must be a valid decimal with up to ${scale} places`;
 };
-const headerSelect=`si.*,st.code AS store_code,st.name AS current_store_name,c.name AS current_customer_name,
+const headerSelect=`si.*,st.code AS store_code,st.name AS current_store_name,c.name AS current_customer_name,ref.mobile AS referred_by_mobile,ref.user_type AS referred_by_user_type,
   COALESCE(pay.paid,0)::numeric(18,2) AS amount_received,
   COALESCE(ret.credited,0)::numeric(18,2) AS return_credit,
   GREATEST(si.total-COALESCE(pay.paid,0)-COALESCE(ret.credited,0),0)::numeric(18,2) AS outstanding_balance,
   CASE WHEN si.status<>'posted' THEN 'unposted' WHEN COALESCE(pay.paid,0)+COALESCE(ret.credited,0)>=si.total THEN 'paid' WHEN COALESCE(pay.paid,0)+COALESCE(ret.credited,0)>0 THEN 'partially_paid' ELSE 'unpaid' END AS payment_status
-  FROM sales_invoices si JOIN stores st ON st.id=si.store_id LEFT JOIN customers c ON c.id=si.customer_id
+  FROM sales_invoices si JOIN stores st ON st.id=si.store_id LEFT JOIN customers c ON c.id=si.customer_id LEFT JOIN users ref ON ref.id=si.referred_by_user_id
   LEFT JOIN LATERAL(SELECT SUM(pa.amount) AS paid FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.status='posted' WHERE pa.sales_invoice_id=si.id AND pa.direction='in') pay ON TRUE
   LEFT JOIN LATERAL(SELECT SUM(sr.customer_credit) AS credited FROM sales_invoice_return_credits sr WHERE sr.sales_invoice_id=si.id AND sr.status='posted') ret ON TRUE`;
 const headerFrom=headerSelect.slice(headerSelect.indexOf("FROM "));
@@ -29,6 +29,7 @@ function validate(body={}){
   if(body.invoiceType!==undefined && !["GST","NON_GST"].includes(body.invoiceType))return {error:"Invalid invoice type"};
   if(!idOk(body.storeId))return {error:"Choose a valid store"};
   if(body.customerId&&!idOk(body.customerId))return {error:"Choose a valid customer"};
+  if(body.referredByUserId&&!idOk(body.referredByUserId))return {error:"Choose a valid referral"};
   if(!Array.isArray(body.items)||body.items.length<1||body.items.length>100)return {error:"An invoice must contain between 1 and 100 item lines"};
   const date=body.invoiceDate||new Date().toISOString().slice(0,10),due=body.dueDate||null;
   if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||(due&&!/^\d{4}-\d{2}-\d{2}$/.test(due))||(due&&due<date))return {error:"Enter valid invoice and due dates"};
@@ -44,7 +45,7 @@ function validate(body={}){
     if(Number(quantity)<=0||(taxRate!==null&&Number(taxRate)>100))return {error:`Line ${i+1}: quantity must be positive and tax rate must be at most 100%`};
     items.push({productId:String(x.productId),unitId:String(x.unitId),quantity,unitPrice:price,discountAmount:discount,taxRate});
   }
-  return {data:{placeOfSupply:String(body.placeOfSupply||'').trim()||null,storeId:String(body.storeId),customerId:body.customerId?String(body.customerId):null,date,due,invoiceDiscount:invDisc,additionalCharges:charges,roundOff,notes:String(body.notes||"").trim()||null,items}};
+  return {data:{placeOfSupply:String(body.placeOfSupply||'').trim()||null,storeId:String(body.storeId),customerId:body.customerId?String(body.customerId):null,referredByUserId:body.referredByUserId?String(body.referredByUserId):null,date,due,invoiceDiscount:invDisc,additionalCharges:charges,roundOff,notes:String(body.notes||"").trim()||null,items}};
 }
 async function permitted(req,res,storeId){if(!await canAccessStore(req.user,storeId)){res.status(403).json({message:"You do not have access to this store"});return false;}return true;}
 async function loadInvoice(id,db=connection){
@@ -126,6 +127,7 @@ export async function createSalesDraft(req,res){
   const c=await connection.connect();try{await c.query("BEGIN");const st=await c.query(`SELECT s.id,s.code,COALESCE(bc.invoice_prefix,s.code) AS invoice_prefix FROM stores s
     LEFT JOIN store_billing_config bc ON bc.store_id=s.id WHERE s.id=$1 AND s.is_active=TRUE FOR SHARE OF s`,[d.storeId]);if(!st.rowCount)throw Object.assign(new Error("Active store not found"),{status:404});
     if(d.customerId){const x=await c.query("SELECT id FROM customers WHERE id=$1 AND is_active=TRUE",[d.customerId]);if(!x.rowCount)throw Object.assign(new Error("Active customer not found"),{status:400});}
+    if(d.referredByUserId){const x=await c.query("SELECT id,name FROM users WHERE id=$1 AND is_active=TRUE AND user_type IN ('Salesperson','Tile Mistire')",[d.referredByUserId]);if(!x.rowCount)throw Object.assign(new Error("Choose an active salesperson or tile mistiri"),{status:400});d.referredByName=x.rows[0].name;}
     const settings=await readInvoiceSettings(c,d.storeId,true);
     d.documentType=req.body.documentType||settings.default_document_type;
     d.invoiceLayout=settings.invoice_layout;
@@ -134,8 +136,8 @@ export async function createSalesDraft(req,res){
     d.settings=await checkDocument(c,d);
     if(req.body.invoiceType && req.body.invoiceType!==d.invoiceType)throw Object.assign(new Error("Store invoice settings changed. Start a new invoice to load the current default."),{status:409});
 
-    const series=(st.rows[0].invoice_prefix||st.rows[0].code||"SALE").toUpperCase();const assignedSalesperson=req.user.userType?.toLowerCase()==="salesperson"?req.user.id:null;const h=await c.query(`INSERT INTO sales_invoices(store_id,customer_id,series,invoice_number,status,invoice_date,due_date,notes,created_by,salesperson_user_id,invoice_type,invoice_layout,document_type,registration_category_snapshot,place_of_supply_state)
-      VALUES($1,$2,$3,NULL,'draft',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,[d.storeId,d.customerId,series,d.date,d.due,d.notes,req.user.id,assignedSalesperson,d.invoiceType,d.invoiceLayout,d.documentType,d.settings.gst_registration_category,d.placeOfSupply]);
+    const series=(st.rows[0].invoice_prefix||st.rows[0].code||"SALE").toUpperCase();const assignedSalesperson=req.user.userType?.toLowerCase()==="salesperson"?req.user.id:null;const h=await c.query(`INSERT INTO sales_invoices(store_id,customer_id,series,invoice_number,status,invoice_date,due_date,notes,created_by,salesperson_user_id,referred_by_user_id,referred_by_name_snapshot,invoice_type,invoice_layout,document_type,registration_category_snapshot,place_of_supply_state)
+      VALUES($1,$2,$3,NULL,'draft',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,[d.storeId,d.customerId,series,d.date,d.due,d.notes,req.user.id,assignedSalesperson,d.referredByUserId,d.referredByName||null,d.invoiceType,d.invoiceLayout,d.documentType,d.settings.gst_registration_category,d.placeOfSupply]);
     await saveItems(c,h.rows[0].id,d);const invoice=await loadInvoice(h.rows[0].id,c);await c.query("COMMIT");return res.status(201).json(invoice);
   }catch(e){await c.query("ROLLBACK").catch(()=>{});return dbError(res,e,"Unable to create sales draft");}finally{c.release();}
 }
@@ -148,12 +150,28 @@ export async function listSales(req,res){
   }catch(e){return dbError(res,e,"Unable to list sales invoices");}
 }
 export async function getSales(req,res){if(!idOk(req.params.id))return res.status(400).json({message:"Invalid invoice ID"});try{const x=await loadInvoice(req.params.id);if(!x)return res.status(404).json({message:"Invoice not found"});if(!await permitted(req,res,x.store_id))return;return res.json(x);}catch(e){return dbError(res,e,"Unable to load invoice");}}
+export async function salesBonusPreview(req,res){
+  const storeId=String(req.body?.storeId||''),referralId=req.body?.referredByUserId;
+  if(!idOk(storeId)||!Array.isArray(req.body?.items)||req.body.items.length>100)return res.status(400).json({message:'Choose a store and provide valid invoice lines'});
+  if(!await permitted(req,res,storeId))return;
+  const discount=decimal(req.body.invoiceDiscount??'0','Invoice discount',{scale:2});if(discount.includes(' must be a valid '))return res.status(400).json({message:discount});
+  if(referralId&&!idOk(referralId))return res.status(400).json({message:'Choose a valid referral'});
+  const items=[];for(const [index,line] of req.body.items.entries()){
+    if(!idOk(line.productId)||!idOk(line.unitId))return res.status(400).json({message:`Line ${index+1}: choose a valid product and unit`});
+    const quantity=decimal(line.quantity,'Quantity'),unitPrice=decimal(line.unitPrice,'Selling price',{scale:4}),discountAmount=decimal(line.discountAmount??'0','Discount',{scale:2});
+    if([quantity,unitPrice,discountAmount].some(value=>value.includes(' must be a valid '))||Number(quantity)<=0)return res.status(400).json({message:`Line ${index+1}: enter a valid quantity, selling price, and discount`});
+    items.push({productId:String(line.productId),unitId:String(line.unitId),quantity,unitPrice,discountAmount});
+  }
+  try{const quote=await quoteSalesInvoiceBonus(connection,{referredByUserId:referralId,items,invoiceDiscount:Number(discount)});const showFinancials=hasPermission(req.user,'bonus_cost.view');return res.json({...quote,items:quote.items.map(item=>showFinancials?item:{productName:item.productName,quantity:item.quantity,sellingPrice:item.sellingPrice,bonusRate:item.bonusRate,bonus:item.bonus}),totals:quote.totals?(showFinancials?quote.totals:{userBonus:quote.totals.userBonus}):null});}
+  catch(e){console.error('Unable to calculate sales bonus preview:',e.message);return res.status(500).json({message:'Unable to calculate sales bonus preview'});}
+}
 export async function updateSalesDraft(req,res){
   const v=validate(req.body);if(v.error)return res.status(400).json({message:v.error,...(v.code?{code:v.code,field:v.field}:{})});const d=v.data;const c=await connection.connect();try{await c.query("BEGIN");const r=await c.query("SELECT store_id,status,invoice_type,invoice_layout,document_type,place_of_supply_state FROM sales_invoices WHERE id=$1 FOR UPDATE",[req.params.id]);if(!r.rowCount)throw Object.assign(new Error("Invoice not found"),{status:404});if(!await permitted(req,res,r.rows[0].store_id)){await c.query("ROLLBACK");return;}if(r.rows[0].status!=="draft")throw Object.assign(new Error("Only draft invoices can be edited"),{status:409});if(String(r.rows[0].store_id)!==d.storeId)throw Object.assign(new Error("The store cannot be changed"),{status:400});
   d.invoiceType=r.rows[0].invoice_type;d.documentType=r.rows[0].document_type;d.invoiceLayout=r.rows[0].invoice_layout;
   if(req.body.documentType&&req.body.documentType!==d.documentType || req.body.invoiceLayout&&req.body.invoiceLayout!==d.invoiceLayout)throw Object.assign(new Error('Invoice document type and appearance cannot be converted; create a replacement draft'),{status:409});
   if(req.body.invoiceType && req.body.invoiceType!==d.invoiceType)throw Object.assign(new Error("Invoice type cannot be converted; create a new draft"),{status:409});
-  await c.query("UPDATE sales_invoices SET customer_id=$2,invoice_date=$3,due_date=$4,notes=$5,place_of_supply_state=$6 WHERE id=$1",[req.params.id,d.customerId,d.date,d.due,d.notes,d.placeOfSupply]);await saveItems(c,req.params.id,d);await c.query("COMMIT");return res.json(await loadInvoice(req.params.id));
+  if(d.referredByUserId){const x=await c.query("SELECT id,name FROM users WHERE id=$1 AND is_active=TRUE AND user_type IN ('Salesperson','Tile Mistire')",[d.referredByUserId]);if(!x.rowCount)throw Object.assign(new Error("Choose an active salesperson or tile mistiri"),{status:400});d.referredByName=x.rows[0].name;}
+  await c.query("UPDATE sales_invoices SET customer_id=$2,referred_by_user_id=$3,referred_by_name_snapshot=$4,invoice_date=$5,due_date=$6,notes=$7,place_of_supply_state=$8 WHERE id=$1",[req.params.id,d.customerId,d.referredByUserId,d.referredByName||null,d.date,d.due,d.notes,d.placeOfSupply]);await saveItems(c,req.params.id,d);await c.query("COMMIT");return res.json(await loadInvoice(req.params.id));
   }catch(e){await c.query("ROLLBACK").catch(()=>{});return dbError(res,e,"Unable to update sales draft");}finally{c.release();}
 }
 async function validateInitialPayment(client,payment,amount,method,total){

@@ -9,6 +9,7 @@ import {
   getTopSeller,
   updateSalesBonusPayment,
   updateProductConfig,
+  saveCatalogProductBonusRule,
 } from "./salesBonus.js";
 
 const configuredProduct = {
@@ -163,6 +164,7 @@ test("returns the authenticated user's sales bonus records with item details", a
       assert.deepEqual(values, [["55"]]);
       return { rows: [item] };
     }
+    if (query.includes("FROM sales_bonus_payments")) return { rows: [] };
     throw new Error(`Unexpected query: ${query}`);
   };
   const response = createResponse();
@@ -179,7 +181,7 @@ test("returns the authenticated user's sales bonus records with item details", a
     mobile: "9876543210",
     userType: "Salesperson",
   });
-  assert.deepEqual(response.body.records, [{ ...record, items: [item] }]);
+  assert.deepEqual(response.body.records, [{ ...record, items: [item], payments: [] }]);
 });
 
 test("allows admins to select a user's sales bonus records", async () => {
@@ -297,7 +299,7 @@ test("records an admin payment against the remaining bonus balance", async () =>
       commands.push(query.trim());
       if (query.includes("SELECT id, final_user_bonus")) {
         return {
-          rows: [{ id: 55, final_user_bonus: "12.00", total_amount_paid: "5.00" }],
+          rows: [{ id: 55, final_user_bonus: "12.00", total_amount_paid: "5.00", payment_method: null, is_fully_paid: false, store_id: null }],
         };
       }
       if (query.includes("UPDATE sales_bonus_records")) {
@@ -318,7 +320,7 @@ test("records an admin payment against the remaining bonus balance", async () =>
   const response = createResponse();
 
   await updateSalesBonusPayment(
-    { params: { id: "55" }, body: { amount: 7, paymentMethod: "UPI" } },
+    { params: { id: "55" }, user: { id: 1 }, body: { amount: 7, paymentMethod: "UPI" } },
     response
   );
 
@@ -411,13 +413,14 @@ test("rejects paid amounts above the final payable", async () => {
   assert.equal(connectCount, 0);
 });
 
-test("lists active and inactive products for management", async () => {
+test("lists active invoice catalog products with any matching bonus rule", async () => {
   const rows = [
-    { id: 3, product_name: "Managed Tile", is_active: true },
-    { id: 4, product_name: "Retired Tile", is_active: false },
+    { product_id: 3, product_name: "Managed Tile", has_bonus_rule: true, is_active: true },
   ];
   connection.query = async (query) => {
-    assert.match(query, /ORDER BY is_active DESC, product_name ASC/);
+    assert.match(query, /FROM products p/);
+    assert.match(query, /WHERE p\.is_active=TRUE/);
+    assert.match(query, /sales_bonus_product_config/);
     return { rows };
   };
   const response = createResponse();
@@ -426,6 +429,23 @@ test("lists active and inactive products for management", async () => {
 
   assert.equal(response.statusCode, 200);
   assert.deepEqual(response.body, rows);
+});
+
+test("saves a bonus rule against an active invoice catalog product", async () => {
+  const calls=[];
+  connection.query=async(query,values)=>{
+    calls.push({query,values});
+    if(query.includes("SELECT id,name FROM products"))return {rows:[{id:43,name:"Costa Blue"}],rowCount:1};
+    if(query.includes("SELECT id FROM sales_bonus_product_config"))return {rows:[],rowCount:0};
+    assert.match(query,/INSERT INTO sales_bonus_product_config\(product_id,product_name/);
+    return {rows:[{id:81,product_id:43,product_name:"Costa Blue",default_bonus_percentage:"10.00"}],rowCount:1};
+  };
+  const response=createResponse();
+  await saveCatalogProductBonusRule({params:{productId:"43"},body:{default_cost_price:"650",default_bonus_percentage:"10",unit_label:"Box"}},response);
+  assert.equal(response.statusCode,200);
+  assert.equal(calls[2].values[0],43);
+  assert.equal(calls[2].values[1],"Costa Blue");
+  assert.equal(calls[2].values[3],10);
 });
 
 test("creates a product configuration with validated values", async () => {
