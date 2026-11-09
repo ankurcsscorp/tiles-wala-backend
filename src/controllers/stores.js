@@ -32,6 +32,17 @@ export async function canManageStore(user, storeId, roles = ["owner", "manager"]
   return result.rows.some((assignment) => roles.includes(assignment.role));
 }
 
+async function invoicePrefixInUse(db, prefix, excludeStoreId = null) {
+  const result=await db.query(`SELECT EXISTS(
+    SELECT 1 FROM store_billing_config WHERE upper(invoice_prefix)=upper($1) AND ($2::bigint IS NULL OR store_id<>$2)
+    UNION ALL SELECT 1 FROM sales_invoices WHERE series=$1 AND ($2::bigint IS NULL OR store_id<>$2)
+    UNION ALL SELECT 1 FROM purchase_invoices WHERE series=$1 AND ($2::bigint IS NULL OR store_id<>$2)
+    UNION ALL SELECT 1 FROM sales_returns WHERE series LIKE $1||'-%' AND ($2::bigint IS NULL OR store_id<>$2)
+    UNION ALL SELECT 1 FROM purchase_returns WHERE series LIKE $1||'-%' AND ($2::bigint IS NULL OR store_id<>$2)
+  ) AS used`,[prefix,excludeStoreId]);
+  return result.rows[0].used;
+}
+
 export async function listStores(req, res) {
   try {
     const result = isAdmin(req)
@@ -71,17 +82,18 @@ function validateStore(body = {}) {
     email: clean(body.email).toLowerCase(), gstin: clean(body.gstin).toUpperCase(), logoUrl: clean(body.logoUrl),
     invoicePrefix: clean(body.invoicePrefix).toUpperCase(), invoiceFooter: clean(body.invoiceFooter),
     terms: clean(body.termsAndConditions), period: clean(body.invoiceNumberingPeriod) || "yearly",
-    padding: Number(body.invoiceNumberPadding ?? 5),
+    padding: Number(body.invoiceNumberPadding ?? 4),
   };
   if (!data.code || data.code.length > 40 || !/^[A-Z0-9][A-Z0-9_-]*$/.test(data.code)) return { error: "Store code is required and may contain letters, numbers, hyphens, or underscores" };
   if (!data.name || data.name.length > 160) return { error: "Store name is required and must be 160 characters or fewer" };
-  if (data.legalName.length > 200 || data.city.length > 100 || data.state.length > 100 || data.pinCode.length > 12 || data.phone.length > 30 || data.email.length > 254 || data.invoicePrefix.length > 24) return { error: "One or more store fields exceed the allowed length" };
+  if (data.legalName.length > 200 || data.city.length > 100 || data.state.length > 100 || data.pinCode.length > 12 || data.phone.length > 30 || data.email.length > 254) return { error: "One or more store fields exceed the allowed length" };
   if (!validEmail(data.email)) return { error: "Enter a valid email address" };
   if (data.gstin && !/^[0-9A-Z]{15}$/.test(data.gstin)) return { error: "GSTIN must contain 15 letters or digits" };
   if (data.logoUrl && data.logoUrl.length > 2000) return { error: "Logo URL must be 2000 characters or fewer" };
   if (!data.invoicePrefix) data.invoicePrefix = data.code;
+  if (!/^[A-Z0-9]{1,4}$/.test(data.invoicePrefix)) return { error: "Invoice code must contain 1–4 uppercase letters or digits" };
   if (!["yearly", "monthly", "never"].includes(data.period)) return { error: "Invoice numbering period must be yearly, monthly, or never" };
-  if (!Number.isInteger(data.padding) || data.padding < 1 || data.padding > 12) return { error: "Invoice number padding must be between 1 and 12" };
+  if (!Number.isInteger(data.padding) || data.padding < 4 || data.padding > 12) return { error: "Invoice number padding must be between 4 and 12" };
   return { data };
 }
 
@@ -91,6 +103,8 @@ export async function createStore(req, res) {
   const client = await connection.connect();
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`invoice-prefix:${data.invoicePrefix}`]);
+    if(await invoicePrefixInUse(client,data.invoicePrefix)){await client.query("ROLLBACK");return res.status(409).json({message:"This invoice code has been used by another store or document series"});}
     const result = await client.query(
       `INSERT INTO stores(code,name,legal_name,address,city,state,pin_code,phone,email,gstin,tax_id,logo_url,invoice_footer,terms_and_conditions,invoice_numbering_period,invoice_number_padding)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12,$13,$14,$15) RETURNING ${storeProfileFields}`,
@@ -116,6 +130,9 @@ export async function updateStore(req, res) {
   const client = await connection.connect();
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`invoice-prefix:${data.invoicePrefix}`]);
+    if(await invoicePrefixInUse(client,data.invoicePrefix,id)){await client.query("ROLLBACK");return res.status(409).json({message:"This invoice code has been used by another store or document series"});}
+    const existing=await client.query(`SELECT c.invoice_prefix,EXISTS(SELECT 1 FROM sales_invoices si WHERE si.store_id=s.id AND si.status<>'draft') AS has_issued FROM stores s LEFT JOIN store_billing_config c ON c.store_id=s.id WHERE s.id=$1 FOR UPDATE OF s`,[id]);
     const result = await client.query(
       `UPDATE stores SET code=$2,name=$3,legal_name=$4,address=$5,city=$6,state=$7,pin_code=$8,phone=$9,email=$10,gstin=$11,tax_id=$11,logo_url=$12,invoice_footer=$13,terms_and_conditions=$14,invoice_numbering_period=$15,invoice_number_padding=$16,updated_at=now()
        WHERE id=$1 RETURNING ${storeProfileFields}`,
@@ -124,6 +141,11 @@ export async function updateStore(req, res) {
     if (!result.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ message: "Store not found" }); }
     await client.query(`INSERT INTO store_billing_config(store_id,invoice_prefix,terms_and_conditions) VALUES($1,$2,$3)
       ON CONFLICT(store_id) DO UPDATE SET invoice_prefix=EXCLUDED.invoice_prefix,terms_and_conditions=EXCLUDED.terms_and_conditions,updated_at=now()`, [id,data.invoicePrefix,data.terms || null]);
+    if(existing.rowCount&&existing.rows[0].invoice_prefix!==data.invoicePrefix){
+      await client.query("UPDATE sales_invoices SET series=$2,updated_at=now() WHERE store_id=$1 AND status='draft'",[id,data.invoicePrefix]);
+      await client.query(`INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,before_data,after_data)
+        VALUES($1,$2,'store.invoice_code.changed','store',$1,$3,$4)`,[id,req.user.id,{invoicePrefix:existing.rows[0].invoice_prefix},{invoicePrefix:data.invoicePrefix,issuedInvoicesPreserved:existing.rows[0].has_issued}]);
+    }
     await client.query("COMMIT");
     res.json({ ...result.rows[0], invoice_prefix: data.invoicePrefix });
   } catch (error) {
@@ -153,7 +175,8 @@ export async function getStoreSettings(req, res) {
     if (!(await canAccessStore(req.user, id))) return res.status(403).json({ message: "You do not have access to this store" });
     const result = await connection.query(
       `SELECT s.id AS store_id,s.legal_name,s.gstin,COALESCE(s.tax_id,s.gstin) AS tax_id,s.address,s.city,s.state,s.pin_code,s.phone,s.email,s.logo_url,s.invoice_footer,s.terms_and_conditions,s.invoice_numbering_period,s.invoice_number_padding,
-       c.tax_inclusive,c.default_tax_rate,c.invoice_prefix,c.settings,c.terms_and_conditions AS billing_terms
+       c.tax_inclusive,c.default_tax_rate,c.invoice_prefix,c.settings,c.terms_and_conditions AS billing_terms,
+       s.dealer_transport_charge
        FROM stores s LEFT JOIN store_billing_config c ON c.store_id=s.id WHERE s.id=$1`, [id]
     );
     if (!result.rowCount) return res.status(404).json({ message: "Store not found" });
@@ -165,8 +188,10 @@ export async function updateStoreSettings(req, res) {
   const id = req.params.id;
   const b = req.body ?? {};
   const taxRate = Number(b.defaultTaxRate);
+  const dealerTransportCharge = Number(b.dealerTransportCharge ?? 1000);
   if (!idPattern.test(id)) return res.status(400).json({ message: "Invalid store ID" });
   if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100 || typeof b.taxInclusive !== "boolean") return res.status(400).json({ message: "Provide a valid tax rate and taxInclusive setting" });
+  if (!Number.isFinite(dealerTransportCharge) || dealerTransportCharge < 0 || Math.round(dealerTransportCharge * 100) !== dealerTransportCharge * 100) return res.status(400).json({ message: "Dealer transport charge must be a nonnegative amount with at most two decimals" });
   const validated = validateStore({ ...b, code: b.code || "STORE", name: b.name || "Store" });
   if (validated.error) return res.status(400).json({ message: validated.error });
   const config = validated.data;
@@ -174,10 +199,19 @@ export async function updateStoreSettings(req, res) {
     const client = await connection.connect();
     try {
       await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`invoice-prefix:${config.invoicePrefix}`]);
+      if(await invoicePrefixInUse(client,config.invoicePrefix,id)){await client.query("ROLLBACK");return res.status(409).json({message:"This invoice code has been used by another store or document series"});}
+      const existing=await client.query(`SELECT c.invoice_prefix,EXISTS(SELECT 1 FROM sales_invoices si WHERE si.store_id=s.id AND si.status<>'draft') AS has_issued FROM stores s LEFT JOIN store_billing_config c ON c.store_id=s.id WHERE s.id=$1 FOR UPDATE OF s`,[id]);
       const updated = await client.query(`UPDATE stores SET legal_name=$2,gstin=$3,tax_id=$3,address=$4,city=$5,state=$6,pin_code=$7,phone=$8,email=$9,logo_url=$10,invoice_footer=$11,terms_and_conditions=$12,invoice_numbering_period=$13,invoice_number_padding=$14,updated_at=now() WHERE id=$1 RETURNING id`, [id,config.legalName||null,config.gstin||null,config.address,config.city||null,config.state||null,config.pinCode||null,config.phone||null,config.email||null,config.logoUrl||null,config.invoiceFooter||null,config.terms||null,config.period,config.padding]);
       if (!updated.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ message: "Store not found" }); }
+      await client.query(`UPDATE stores SET dealer_transport_charge=$2,updated_at=now() WHERE id=$1`, [id,dealerTransportCharge]);
       await client.query(`INSERT INTO store_billing_config(store_id,tax_inclusive,default_tax_rate,invoice_prefix,terms_and_conditions) VALUES($1,$2,$3,$4,$5)
         ON CONFLICT(store_id) DO UPDATE SET tax_inclusive=EXCLUDED.tax_inclusive,default_tax_rate=EXCLUDED.default_tax_rate,invoice_prefix=EXCLUDED.invoice_prefix,terms_and_conditions=EXCLUDED.terms_and_conditions,updated_at=now()`, [id,b.taxInclusive,taxRate,config.invoicePrefix,config.terms||null]);
+      if(existing.rowCount&&existing.rows[0].invoice_prefix!==config.invoicePrefix){
+        await client.query("UPDATE sales_invoices SET series=$2,updated_at=now() WHERE store_id=$1 AND status='draft'",[id,config.invoicePrefix]);
+        await client.query(`INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,before_data,after_data)
+          VALUES($1,$2,'store.invoice_code.changed','store',$1,$3,$4)`,[id,req.user.id,{invoicePrefix:existing.rows[0].invoice_prefix},{invoicePrefix:config.invoicePrefix,issuedInvoicesPreserved:existing.rows[0].has_issued}]);
+      }
       await client.query("COMMIT");
       return getStoreSettings(req,res);
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }

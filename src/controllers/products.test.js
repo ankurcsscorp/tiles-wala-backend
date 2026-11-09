@@ -20,6 +20,37 @@ test("product validation rejects missing base units and invalid conversions befo
   assert.match(invalidFactor.body.message,/positive decimals/);
 });
 
+test("dealer price validation rejects invalid precision and duplicate unit entries before connecting",async()=>{
+  originalConnect=connection.connect;
+  connection.connect=async()=>{throw new Error("Invalid dealer price must not connect");};
+  const invalid=response();
+  await createProduct({user:{userType:"Admin"},body:{sku:"D-1",name:"Dealer tile",baseUnitId:"1",dealerPrices:[{unitId:"1",price:"8.12345"}]}},invalid);
+  assert.equal(invalid.statusCode,400);
+  assert.match(invalid.body.message,/4 decimal places/);
+  const duplicate=response();
+  await createProduct({user:{userType:"Admin"},body:{sku:"D-1",name:"Dealer tile",baseUnitId:"1",dealerPrices:[{unitId:"1",price:"8"},{unitId:"1",price:"9"}]}},duplicate);
+  assert.equal(duplicate.statusCode,400);
+  assert.match(duplicate.body.message,/once per unit/);
+});
+
+test("MRP is optional but must be nonnegative, use two decimal places, and accompany a unit dealer price",async()=>{
+  originalConnect=connection.connect;connection.connect=async()=>{throw new Error("Invalid MRP must not connect");};
+  const tooPrecise=response();await createProduct({user:{userType:"Admin"},body:{sku:"MRP-1",name:"Tile",baseUnitId:"1",dealerPrices:[{unitId:"1",price:"850",mrp:"1200.001"}]}},tooPrecise);
+  assert.equal(tooPrecise.statusCode,400);assert.match(tooPrecise.body.message,/MRP.*2 decimal places/);
+  const withoutDealerPrice=response();await createProduct({user:{userType:"Admin"},body:{sku:"MRP-2",name:"Tile",baseUnitId:"1",dealerPrices:[{unitId:"1",price:"",mrp:"1200"}]}},withoutDealerPrice);
+  assert.equal(withoutDealerPrice.statusCode,400);assert.match(withoutDealerPrice.body.message,/dealer price/);
+  const negative=response();await createProduct({user:{userType:"Admin"},body:{sku:"MRP-3",name:"Tile",baseUnitId:"1",dealerPrices:[{unitId:"1",price:"850",mrp:"-1"}]}},negative);
+  assert.equal(negative.statusCode,400);
+});
+
+test("only admins can submit dealer price or ordering availability changes",async()=>{
+  originalConnect=connection.connect;
+  connection.connect=async()=>{throw new Error("Unauthorized product mutation must not connect");};
+  const res=response();
+  await createProduct({user:{userType:"Salesperson"},body:{sku:"D-2",name:"Dealer tile",baseUnitId:"1",dealerPrices:[{unitId:"1",price:"850"}]}},res);
+  assert.equal(res.statusCode,403);
+});
+
 test("product listing binds filters, caps pagination, and returns pagination metadata",async()=>{
   const calls=[];originalQuery=connection.query;
   connection.query=async(sql,values)=>{calls.push({sql,values});return calls.length===1?{rows:[{total:1}]}:{rows:[{id:"4",sku:"T-4",store_stock:"2.5"}]};};

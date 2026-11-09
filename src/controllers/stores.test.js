@@ -50,7 +50,7 @@ test("store creation rejects invalid and duplicate codes",async()=>{
   const error=new Error("duplicate");error.code="23505";
   connection.connect=async()=>({query:async(sql)=>{if(sql==="BEGIN"||sql==="ROLLBACK")return {};throw error;},release(){}});
   const duplicate=response();
-  await createStore({body:{name:"North",code:"NORTH"}},duplicate);
+  await createStore({body:{name:"North",code:"NORTH",invoicePrefix:"N"}},duplicate);
   assert.equal(duplicate.statusCode,409);
   assert.match(duplicate.body.message,/already exists/);
 });
@@ -62,6 +62,7 @@ test("store creation atomically saves profile and billing defaults",async()=>{
     query:async(sql,values)=>{
       calls.push({sql,values});
       if(sql.includes("INSERT INTO stores")) return {rows:[{id:"22",code:"EAST",name:"East"}],rowCount:1};
+      if(sql.includes("AS used")) return {rows:[{used:false}],rowCount:1};
       return {rows:[],rowCount:1};
     },release(){}
   });
@@ -71,8 +72,10 @@ test("store creation atomically saves profile and billing defaults",async()=>{
   assert.equal(res.body.code,"EAST");
   assert.equal(res.body.invoice_prefix,"E");
   assert.equal(calls[0].sql,"BEGIN");
-  assert.match(calls[1].sql,/INSERT INTO stores/);
-  assert.equal(calls[1].values[0],"EAST");
-  assert.match(calls[2].sql,/INSERT INTO store_billing_config/);
-  assert.equal(calls[3].sql,"COMMIT");
+  assert.ok(calls.some(call=>call.sql.includes("pg_advisory_xact_lock")));
+  const storeInsert=calls.find(call=>call.sql.includes("INSERT INTO stores"));
+  assert.ok(storeInsert);
+  assert.equal(storeInsert.values[0],"EAST");
+  assert.ok(calls.some(call=>call.sql.includes("INSERT INTO store_billing_config")));
+  assert.equal(calls.at(-1).sql,"COMMIT");
 });

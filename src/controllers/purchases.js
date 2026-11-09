@@ -3,6 +3,8 @@ import {INVOICE_LAYOUTS} from '../services/invoicePolicy.js';
 import {SUPPLIER_DOCUMENT_TYPES,validateSupplierTaxFacts} from '../services/purchaseTaxFacts.js';
 import { connection } from "../../connection.js";
 import { canAccessStore, canManageStore } from "./stores.js";
+import PDFDocument from "pdfkit";
+import { fileURLToPath } from "node:url";
 
 const isAdmin=(req)=>req.user?.userType?.toLowerCase()==="admin";
 const idOk=(id)=>/^\d+$/.test(String(id??""));
@@ -188,10 +190,87 @@ export async function getPurchase(req,res){
   try{const purchase=await loadPurchase(req.params.id);if(!purchase)return res.status(404).json({message:"Purchase invoice not found"});if(!await storeAuthorized(req,res,purchase.store_id))return;return res.json(purchase);}
   catch(error){return respondDbError(res,error,"Unable to load purchase invoice");}
 }
+
+export async function downloadPurchasePdf(req,res){
+  if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});
+  try{const purchase=await loadPurchase(req.params.id);if(!purchase)return res.status(404).json({message:"Purchase invoice not found"});if(!await storeAuthorized(req,res,purchase.store_id))return;
+    const filename=`Purchase_${String(purchase.invoice_number||purchase.id).replace(/[^A-Za-z0-9_-]/g,"_")}.pdf`;
+    res.setHeader("Content-Type","application/pdf");res.setHeader("Content-Disposition",`attachment; filename="${filename}"`);
+    const doc=new PDFDocument({size:"A4",margin:36,bufferPages:true});doc.pipe(res);
+    const fontPath=fileURLToPath(new URL("../../assets/fonts/NotoSansDevanagari.ttf",import.meta.url));
+    doc.registerFont("Tiles",fontPath);doc.font("Tiles");
+    const left=36,right=559,width=right-left,bottom=790;let y=36;
+    const safe=value=>typeof value==="string"||typeof value==="number"?String(value).trim():"";
+    const grouped=value=>{const m=String(value??"").match(/^(-?)(\d+)(?:\.(\d+))?$/);if(!m)return "—";return `${m[1]?"−":""}₹${new Intl.NumberFormat("en-IN").format(BigInt(m[2]))}.${(m[3]||"").padEnd(2,"0").slice(0,2)}`;};
+    const quantity=value=>{const m=String(value??"").match(/^(-?)(\d+)(?:\.(\d+))?$/);if(!m)return "—";const f=(m[3]||"").replace(/0+$/g,"");return `${m[1]}${m[2]}${f?`.${f}`:""}`;};
+    const date=value=>{const m=String(value??"").match(/^(\d{4})-(\d{2})-(\d{2})/);return m?`${m[3]} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][Number(m[2])-1]||""} ${m[1]}`:"—";};
+    const text=(value,x,top,w,opts={})=>{doc.font("Tiles").fontSize(opts.size||8).fillColor(opts.color||"#25313d").text(safe(value)||"—",x,top,{width:w,ellipsis:true,lineBreak:true,align:opts.align||"left"});};
+    const addressLines=snapshot=>{if(!snapshot||typeof snapshot!=="object")return typeof snapshot==="string"?[snapshot]:[];const address=snapshot.address??snapshot.billingAddress??snapshot;const a=typeof address==="string"?{line1:address}:address&&typeof address==="object"?address:{};const locality=[a.city||snapshot.city,a.state||snapshot.state].filter(Boolean).join(", ");const region=[locality,a.pinCode||a.pin_code||snapshot.pinCode||snapshot.pin_code].filter(Boolean).join(" – ");return [a.line1||a.street||(typeof a.address==="string"?a.address:""),a.line2,region].map(safe).filter(Boolean);};
+    const startPage=()=>{doc.addPage();y=36;};
+    const storeName=safe(purchase.store_name_snapshot)||safe(purchase.store_name)||"Store";
+    const status=purchase.status==="reversed"?"REVERSED PURCHASE RECORD":purchase.status==="cancelled"?"CANCELLED PURCHASE RECORD":purchase.status==="draft"?"DRAFT PURCHASE RECORD":"INTERNAL PURCHASE RECORD";
+    text(storeName,left,y,300,{size:16,color:"#24364a"});text(status,355,y,204,{size:9,align:"right",color:"#24364a"});y+=22;
+    for(const line of addressLines(purchase.store_address_snapshot)){text(line,left,y,320,{size:7.5});y+=11;}
+    const contacts=[purchase.store_phone_snapshot&&`Phone: ${purchase.store_phone_snapshot}`,purchase.store_email_snapshot,purchase.store_tax_id_snapshot&&`GSTIN: ${purchase.store_tax_id_snapshot}`].filter(Boolean);
+    if(contacts.length){text(contacts.join(" · "),left,y,500,{size:7.5});y+=12;}
+    text(`Purchase reference: ${purchase.invoice_number||"—"}    Status: ${purchase.status||"—"}`,355,58,204,{size:8,align:"right"});
+    doc.moveTo(left,y+2).lineTo(right,y+2).lineWidth(1).strokeColor("#536273").stroke();y+=14;
+    const supplier=purchase.supplier_details_snapshot||{};const supplierLines=[safe(supplier.name)||safe(purchase.supplier_name)||"Supplier details unavailable",...addressLines(supplier),safe(supplier.gstin||supplier.tax_id)&&`GSTIN: ${supplier.gstin||supplier.tax_id}`,`Supplier invoice: ${safe(purchase.supplier_invoice_number)||"—"}`].filter(Boolean);
+    const purchaseLines=[`Purchase date: ${date(purchase.invoice_date)}`,`Supplier invoice date: ${date(purchase.supplier_invoice_date||purchase.invoice_date)}`,`Store / warehouse: ${storeName}`];
+    text("SUPPLIER DETAILS",left,y,250,{size:7,color:"#536273"});text("PURCHASE DETAILS",320,y,239,{size:7,color:"#536273"});y+=13;
+    let leftY=y,rightY=y;for(const line of supplierLines){const h=doc.heightOfString(line,{width:250,font:"Tiles",fontSize:8})+2;text(line,left,leftY,250,{size:8});leftY+=h;}for(const line of purchaseLines){text(line,320,rightY,239,{size:8});rightY+=13;}y=Math.max(leftY,rightY)+9;
+    const columns=[{label:"#",w:20,align:"center"},{label:"Product / description",w:185},{label:"HSN",w:42,align:"center"},{label:"Quantity / unit",w:70},{label:"Purchase rate",w:60},{label:"Tax",w:64},{label:"Amount",w:82}];
+    const drawTableHeader=()=>{let x=left;doc.rect(left,y,width,19).fill("#edf1f4");for(const c of columns){text(c.label,x+2,y+5,c.w-4,{size:6.8,align:c.align||"left",color:"#34465a"});x+=c.w;}y+=19;};
+    const pageForTable=()=>{startPage();y=36;drawTableHeader();};
+    drawTableHeader();
+    for(const [index,item] of (purchase.items||[]).entries()){
+      const product=[safe(item.product_name_snapshot||item.product_name)||"Product",safe(item.sku)&&`SKU: ${safe(item.sku)}`,safe(item.product_snapshot?.tileSize),safe(item.description)].filter((v,i,a)=>v&&a.indexOf(v)===i).join("\n");
+      const rowHeight=Math.max(25,doc.heightOfString(product,{width:177,font:"Tiles",fontSize:7.5})+8);
+      if(y+rowHeight>bottom-12)pageForTable();
+      const values=[String(index+1),product,safe(item.product_snapshot?.hsnCode)||"—",`${quantity(item.quantity)} ${safe(item.unit_name||item.unit_code)||"—"}`,grouped(item.unit_price),`${quantity(item.tax_rate)}%\n${grouped(item.tax_amount)}`,grouped(item.line_total)];
+      let x=left;for(let c=0;c<columns.length;c++){const col=columns[c];text(values[c],x+2,y+4,col.w-4,{size:c===1?7.5:7,align:col.align||(c>=4?"right":"left")});x+=col.w;}
+      y+=rowHeight;doc.moveTo(left,y).lineTo(right,y).lineWidth(.4).strokeColor("#c9d0d6").stroke();
+    }
+    y+=12;
+    const optionalTotalRows=[['Discount',purchase.discount_total],['GST',purchase.tax_total],['Freight',purchase.freight_amount],['Other charges',purchase.additional_charges],['Round-off',purchase.round_off]].filter(([,value])=>Number(value));
+    const totalRows=[["Subtotal",purchase.subtotal],...optionalTotalRows,["Grand Total",purchase.total],["Amount Paid",purchase.paid_amount],["Outstanding",purchase.outstanding_balance]];
+    const notesHeight=purchase.notes?doc.heightOfString(String(purchase.notes),{width:290,font:"Tiles",fontSize:8})+20:0;
+    const leftDetailsHeight=(purchase.supplier_document_type==="GST_TAX_INVOICE"?55:0)+notesHeight;
+    const totalsHeight=totalRows.length*15+30;if(y+Math.max(leftDetailsHeight,totalsHeight)>bottom)startPage();
+    let detailY=y;if(purchase.supplier_document_type==="GST_TAX_INVOICE"){text("GST breakup",left,detailY,290,{size:7,color:"#536273"});detailY+=13;for(const [label,value] of [["CGST",purchase.cgst_total],["SGST",purchase.sgst_total],["IGST",purchase.igst_total]]){text(label,left,detailY,100,{size:8});text(grouped(value),left+105,detailY,100,{size:8,align:"right"});detailY+=13;}}
+    if(purchase.notes){detailY+=8;text("Notes",left,detailY,290,{size:7,color:"#536273"});detailY+=11;doc.font("Tiles").fontSize(8).fillColor("#25313d").text(String(purchase.notes),left,detailY,{width:290});detailY=doc.y;}
+    for(const [label,value] of totalRows){const emphasis=label==="Grand Total"||label==="Outstanding";if(emphasis)doc.rect(365,y-1,194,15).fill("#f0f3f5");text(label,371,y,90,{size:emphasis?8.5:8,color:emphasis?"#24364a":"#25313d"});text(grouped(value),462,y,97,{size:emphasis?8.5:8,align:"right",color:emphasis?"#24364a":"#25313d"});y+=15;}
+    y=Math.max(y,detailY)+8;text("This is an internal purchase record based on supplier invoice details entered in Tiles Wala. It is not a supplier-issued tax invoice.",left,y,width,{size:6.5,color:"#65717d"});
+    doc.end();
+  }catch(error){if(!res.headersSent)return respondDbError(res,error,"Unable to generate purchase PDF");res.destroy(error);}
+}
 export async function getPurchaseItems(req,res){
   if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});
   try{const purchase=await loadPurchase(req.params.id);if(!purchase)return res.status(404).json({message:"Purchase invoice not found"});if(!await storeAuthorized(req,res,purchase.store_id))return;return res.json(purchase.items);}
   catch(error){return respondDbError(res,error,"Unable to load purchase items");}
+}
+
+export async function deletePurchaseDraft(req,res){
+  if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});
+  const client=await connection.connect();
+  try{await client.query("BEGIN");const row=await client.query("SELECT id,store_id,status,invoice_number FROM purchase_invoices WHERE id=$1 FOR UPDATE",[req.params.id]);if(!row.rowCount)throw Object.assign(new Error("Purchase invoice not found"),{status:404});const inv=row.rows[0];if(!await storeAuthorized(req,res,inv.store_id)){await client.query("ROLLBACK");return;}if(inv.status!=="draft")throw Object.assign(new Error("Only draft purchase invoices can be deleted"),{status:409});await client.query("DELETE FROM purchase_invoice_items WHERE purchase_invoice_id=$1",[inv.id]);await client.query("DELETE FROM purchase_invoices WHERE id=$1",[inv.id]);await client.query("INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,before_data) VALUES($1,$2,'purchase.draft.deleted','purchase_invoice',$3,$4)",[inv.store_id,req.user.id,inv.id,{invoiceNumber:inv.invoice_number,status:inv.status}]);await client.query("COMMIT");return res.json({deleted:true,id:inv.id});}catch(error){await client.query("ROLLBACK").catch(()=>{});return respondDbError(res,error,"Unable to delete purchase draft");}finally{client.release();}
+}
+
+export async function duplicatePurchaseDraft(req,res){
+  if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});
+  try{const original=await loadPurchase(req.params.id);if(!original)return res.status(404).json({message:"Purchase invoice not found"});if(!await storeAuthorized(req,res,original.store_id))return;req.body={storeId:String(original.store_id),supplierId:String(original.supplier_id),invoiceDate:new Date().toISOString().slice(0,10),dueDate:null,supplierInvoiceNumber:"",notes:original.notes||"",freightAmount:original.freight_amount,additionalCharges:original.additional_charges,roundOff:original.round_off,invoiceLayout:original.invoice_layout,supplierDocumentType:original.supplier_document_type,supplierTaxJurisdiction:original.supplier_tax_jurisdiction,supplierTaxReason:original.supplier_tax_reason,declaredTaxTotal:original.declared_tax_total,items:original.items.map(x=>({productId:String(x.product_id),unitId:String(x.unit_id),quantity:x.quantity,unitPrice:x.unit_price,discountAmount:x.discount_amount,taxRate:x.tax_rate}))};return createPurchaseDraft(req,res);}catch(error){return respondDbError(res,error,"Unable to duplicate purchase draft");}
+}
+
+export async function purchaseRevisionHistory(req,res){
+  if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});try{const p=await connection.query("SELECT store_id FROM purchase_invoices WHERE id=$1",[req.params.id]);if(!p.rowCount)return res.status(404).json({message:"Purchase invoice not found"});if(!await storeAuthorized(req,res,p.rows[0].store_id))return;const rows=await connection.query("SELECT a.id,a.action,a.before_data,a.after_data,a.created_at,u.name AS changed_by FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id WHERE a.entity_type='purchase_invoice' AND a.entity_id=$1 ORDER BY a.created_at,a.id",[req.params.id]);return res.json({items:rows.rows});}catch(error){return respondDbError(res,error,"Unable to load purchase history");}
+}
+
+export async function purchaseEditPreview(req,res){
+  if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});try{const p=await loadPurchase(req.params.id);if(!p)return res.status(404).json({message:"Purchase invoice not found"});if(!await storeAuthorized(req,res,p.store_id))return;const draft=p.status==="draft",posted=p.status==="posted";return res.json({invoiceId:String(p.id),invoiceNumber:p.invoice_number,status:p.status,eligible:draft,reason:draft?"Draft purchases can be edited using the complete purchase form.":posted?"Posted purchase records and lines are immutable in the current accounting model. A full purchase revision workflow is required before changing posted amounts, tax, supplier, or item quantities.":"Only active draft purchases can be edited.",blockers:posted?["Posted purchase item rows are protected by the database lifecycle trigger.","Stock, supplier payments, returns, and GST corrections need a coordinated revision workflow."]:draft?[]:[`A ${p.status} purchase cannot be edited.`]});}catch(error){return respondDbError(res,error,"Unable to preview purchase edit");}
+}
+
+export async function purchaseCancellationPreview(req,res){
+  if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});try{const p=await loadPurchase(req.params.id);if(!p)return res.status(404).json({message:"Purchase invoice not found"});if(!await storeAuthorized(req,res,p.store_id))return;const d=await connection.query(`SELECT EXISTS(SELECT 1 FROM purchase_receipts WHERE purchase_invoice_id=$1 AND status='posted') has_receipts,EXISTS(SELECT 1 FROM payment_allocations pa JOIN payments pay ON pay.id=pa.payment_id AND pay.status='posted' WHERE pa.purchase_invoice_id=$1 AND pa.direction='out') has_payments,(EXISTS(SELECT 1 FROM purchase_returns WHERE purchase_invoice_id=$1 AND status IN('draft','posted')) OR EXISTS(SELECT 1 FROM purchase_invoice_return_credits WHERE purchase_invoice_id=$1 AND status='posted')) has_returns,EXISTS(SELECT 1 FROM purchase_invoices WHERE store_id=$2 AND supplier_id=$3 AND status='posted' AND id<>$1) has_other_supplier_invoices`,[p.id,p.store_id,p.supplier_id]);const deps=d.rows[0],eligible=p.status==="posted"&&!deps.has_receipts&&!deps.has_payments&&!deps.has_returns;return res.json({invoiceId:String(p.id),invoiceNumber:p.invoice_number,status:p.status,amount:p.total,paidAmount:p.paid_amount,outstanding:p.outstanding_balance,stockImpact:deps.has_receipts?"Posted goods receipts exist; reverse them through goods receipt management first.":"No posted goods receipt; invoice cancellation would not change stock.",paymentImpact:deps.has_payments?"Supplier payment allocations exist and are preserved; reallocate them through payment management first.":"No allocated supplier payments.",ledgerImpact:"The supplier ledger is derived from posted purchase invoices; reversing this invoice removes its payable entry.",returnImpact:deps.has_returns?"Purchase returns or credits exist; reconcile the return chain first.":"No linked purchase returns or credits.",otherSupplierInvoices:deps.has_other_supplier_invoices,eligible,blockers:[...(p.status!=="posted"?["Only a posted invoice can be cancelled from this workflow."]:[]),...(deps.has_receipts?["Posted goods receipts must be reversed first."]:[]),...(deps.has_payments?["Allocated supplier payments must be resolved first; payment records will not be deleted."]:[]),...(deps.has_returns?["Linked purchase returns or credits must be reconciled first."]:[])]});}catch(error){return respondDbError(res,error,"Unable to preview purchase cancellation");}
 }
 
 export async function updatePurchaseDraft(req,res){
@@ -259,7 +338,7 @@ export async function reverseGoodsReceipt(req,res){
 
 async function changePurchaseStatus(req,res,status){
   if(!idOk(req.params.id))return res.status(400).json({message:"Invalid purchase invoice ID"});const client=await connection.connect();
-  try{await client.query("BEGIN");const found=await client.query("SELECT store_id,status FROM purchase_invoices WHERE id=$1 FOR UPDATE",[req.params.id]);if(!found.rowCount){await client.query("ROLLBACK");return res.status(404).json({message:"Purchase invoice not found"});}const invoice=found.rows[0];if(!await storeAuthorized(req,res,invoice.store_id)){await client.query("ROLLBACK");return;}if(status==="cancelled"&&invoice.status!=="draft"){await client.query("ROLLBACK");return res.status(409).json({message:"Only draft purchase invoices can be cancelled"});}if(status==="reversed"){
+  try{await client.query("BEGIN");const found=await client.query("SELECT store_id,supplier_id,status FROM purchase_invoices WHERE id=$1 FOR UPDATE",[req.params.id]);if(!found.rowCount){await client.query("ROLLBACK");return res.status(404).json({message:"Purchase invoice not found"});}const invoice=found.rows[0];if(!await storeAuthorized(req,res,invoice.store_id)){await client.query("ROLLBACK");return;}if(status==="cancelled"&&invoice.status!=="draft"){await client.query("ROLLBACK");return res.status(409).json({message:"Only draft purchase invoices can be cancelled"});}if(req.body?.duplicateOfInvoiceId){if(!idOk(req.body.duplicateOfInvoiceId)){await client.query("ROLLBACK");return res.status(400).json({message:"Invalid original invoice ID"});}const original=await client.query("SELECT id FROM purchase_invoices WHERE id=$1 AND store_id=$2 AND supplier_id=$3 AND status='posted' FOR UPDATE",[req.body.duplicateOfInvoiceId,invoice.store_id,invoice.supplier_id]);if(!original.rowCount||String(original.rows[0].id)===String(req.params.id)){await client.query("ROLLBACK");return res.status(400).json({message:"Choose another posted invoice for the same supplier and store"});}}if(status==="reversed"){
     if(!await canManageStore(req.user,invoice.store_id,["owner","manager"],client)){await client.query("ROLLBACK");return res.status(403).json({message:"Manager authorization is required to reverse a posted purchase invoice"});}
     if(invoice.status!=="posted"){await client.query("ROLLBACK");return res.status(409).json({message:"Only posted invoices can be reversed"});}
     const dependencies=await client.query(`SELECT EXISTS(SELECT 1 FROM purchase_receipts WHERE purchase_invoice_id=$1 AND status='posted') AS has_receipts,
@@ -267,7 +346,7 @@ async function changePurchaseStatus(req,res,status){
       (EXISTS(SELECT 1 FROM purchase_returns WHERE purchase_invoice_id=$1 AND status='posted') OR EXISTS(SELECT 1 FROM purchase_invoice_return_credits WHERE purchase_invoice_id=$1 AND status='posted')) AS has_returns`,[req.params.id]);
     if(dependencies.rows[0].has_receipts||dependencies.rows[0].has_payments||dependencies.rows[0].has_returns){await client.query("ROLLBACK");return res.status(409).json({message:"Reverse related returns, goods receipts and supplier payments before reversing the purchase invoice"});}
   }
-  await client.query("UPDATE purchase_invoices SET status=$2,updated_at=now() WHERE id=$1",[req.params.id,status]);await client.query("INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id) VALUES($1,$2,$3,'purchase_invoice',$4)",[invoice.store_id,req.user.id,`purchase.invoice.${status}`,req.params.id]);await client.query("COMMIT");return res.json(await loadPurchase(req.params.id));
+  await client.query("UPDATE purchase_invoices SET status=$2,updated_at=now() WHERE id=$1",[req.params.id,status]);await client.query("INSERT INTO audit_logs(store_id,user_id,action,entity_type,entity_id,after_data) VALUES($1,$2,$3,'purchase_invoice',$4,$5)",[invoice.store_id,req.user.id,`purchase.invoice.${status}`,req.params.id,{reason:String(req.body?.reason||"Manager reversal").slice(0,500),duplicateOfInvoiceId:req.body?.duplicateOfInvoiceId||null}]);await client.query("COMMIT");return res.json(await loadPurchase(req.params.id));
   }catch(error){await client.query("ROLLBACK").catch(()=>{});return respondDbError(res,error,"Unable to change purchase invoice status");}finally{client.release();}
 }
 export const cancelPurchase=(req,res)=>changePurchaseStatus(req,res,"cancelled");

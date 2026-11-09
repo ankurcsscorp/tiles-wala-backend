@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {connection} from '../connection.js';
 import {getInvoiceSettings,putInvoiceSettings} from './controllers/invoiceSettings.js';
-import {createPurchaseDraft,updatePurchaseDraft,getPurchase,postPurchaseInvoice,receivePurchaseGoods} from './controllers/purchases.js';
+import {createPurchaseDraft,updatePurchaseDraft,getPurchase,postPurchaseInvoice} from './controllers/purchases.js';
 import {createSupplierPayment} from './controllers/payments.js';
 import {getSupplierBalance,getSupplierLedger} from './controllers/suppliers.js';
 import {createReturn,postReturn} from './controllers/returns.js';
@@ -46,10 +46,9 @@ test('shared billing mode preserves supplier GST, receipts, payments, returns, a
   // Store defaults and master supplier edits never rewrite posted supplier identity or amounts.
   await invoke(putInvoiceSettings,{id:stores[0].id},{invoiceLayout:'SIMPLE_LAYOUT'});
   assert.equal(JSON.stringify((await invoke(getPurchase,{id})).body),finalized);
-  const receipt={idempotencyKey:'receipt-'+suffix,items:[{purchaseInvoiceItemId:draft.body.items[0].id,quantityReceived:'1'}]};
-  result=await invoke(receivePurchaseGoods,{id},receipt);assert.equal(result.statusCode,201,JSON.stringify(result.body));
-  assert.equal((await invoke(receivePurchaseGoods,{id},receipt)).body.duplicate,true);
-  assert.equal((await c.query('SELECT quantity FROM inventory_balances WHERE store_id=$1 AND product_id=$2',[stores[0].id,product.id])).rows[0].quantity,'4.0000');
+  assert.equal(result.body.items[0].quantity_received,'2.0000');
+  assert.equal(result.body.receipts.length,1);assert.equal(result.body.receipts[0].status,'posted');
+  assert.equal((await c.query('SELECT quantity FROM inventory_balances WHERE store_id=$1 AND product_id=$2',[stores[0].id,product.id])).rows[0].quantity,'8.0000');
   const payment={storeId:String(stores[0].id),partyId:String(registered.id),amount:'100',paymentMethod:'cash',idempotencyKey:'payment-'+suffix,allocations:[{invoiceId:String(id),amount:'100'}]};
   result=await invoke(createSupplierPayment,{},payment);assert.equal(result.statusCode,201,JSON.stringify(result.body));assert.equal((await invoke(createSupplierPayment,{},payment)).body.duplicate,true);
   assert.equal((await invoke(getPurchase,{id})).body.outstanding_balance,'136.00');
@@ -58,7 +57,7 @@ test('shared billing mode preserves supplier GST, receipts, payments, returns, a
   const returned=await invoke(createReturn,{type:'purchase'},{invoiceId:id,reason:'Supplier return test',items:[{invoiceItemId:draft.body.items[0].id,quantity:'0.5'}]});assert.equal(returned.statusCode,201,JSON.stringify(returned.body));assert.equal(returned.body.tax_adjustment,'9.00');
   result=await invoke(postReturn,{type:'purchase',id:returned.body.id});assert.equal(result.statusCode,200,JSON.stringify(result.body));
   assert.equal((await invoke(getPurchase,{id})).body.outstanding_balance,'77.00');
-  assert.equal((await c.query('SELECT quantity FROM inventory_balances WHERE store_id=$1 AND product_id=$2',[stores[0].id,product.id])).rows[0].quantity,'2.0000');
+  assert.equal((await c.query('SELECT quantity FROM inventory_balances WHERE store_id=$1 AND product_id=$2',[stores[0].id,product.id])).rows[0].quantity,'6.0000');
   result=await invoke(getSupplierLedger,{id:registered.id},{},{storeId:String(stores[0].id)});assert.equal(result.statusCode,200);assert.ok(result.body.some(x=>x.entry_type==='purchase_return'));assert.ok(result.body.some(x=>x.entry_type==='payment'));
   // Explicit legacy GST purchase requests retain their original tax workflow.
   await invoke(putInvoiceSettings,{id:stores[1].id},{invoiceLayout:'STANDARD_GST_LAYOUT'});

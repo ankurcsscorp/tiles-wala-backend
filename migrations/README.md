@@ -50,8 +50,42 @@ Migration 035 adds optional salesperson/tile-mistiri referral links and name sna
 
 Migration 036 enables invoice-driven sales bonuses. Posted invoices now create bonus records for the selected referral only; existing cost, product bonus-rate, eligibility, and salesperson-versus-tile-mistiri calculation rules remain in effect. Invoice referrals are sourced directly from `sales_invoices`; staff no longer need a separate recipient assignment for the invoice.
 
+Migration 062 adds immutable, numbered operational revisions for posted sales invoices. Admins can correct vehicle and driver details with a required reason, preview token, optimistic revision check, and idempotency key. Invoice amounts, tax, products, transport charges, payment allocations, stock movements, and bonus records remain unchanged; financial edits require a separate authorized correction-document workflow.
+
 Migration 037 adds invoice-bonus approval snapshots and an append-only bonus-payment history with idempotency keys. Invoice-linked records are pending approval until Admin approval; approved payable amounts accrue with posted customer collections. Returns and invoice reversals continue to append bonus adjustments, and already-paid amounts remain visible as recovery due. The down migration refuses to remove payment history after it has been used.
 
 Migration 038 records an Admin payout override when an approved invoice bonus is paid before customer collections make the full bonus payable. Admins may record a partial or full payout up to the approved bonus less return/reversal adjustments; normal payable amounts still accrue with collections unless Admin explicitly pays early. Early payout is retained across later collection refreshes.
 
 Migration 039 records risky bonus approvals made while the related sales invoice has an outstanding balance. The approver must provide a reason; the unpaid invoice amount at approval and reason are retained with the approval record.
+
+Migration 043 adds explicit dealer prices per product/unit and the product-level dealer-ordering switch. Existing retail and purchase prices remain unchanged. Admin product edits validate unit membership and save prices with conversion changes transactionally. Apply with `npm run migrate`; the down migration removes the new dealer price configuration.
+
+Migration 044 adds the store-configured dealer transport charge (default INR 1,000 per order). Dealer order submission snapshots the single per-order fee and checks stock availability; it does not reserve or deduct inventory.
+
+Migration 046 links dealer order receipts to the existing `payments` customer receipt ledger and adds Razorpay payment attempts plus a deduplicated webhook event inbox. Only a signature-verified `payment.captured` event creates a posted UPI receipt; browser callbacks remain pending verification. COD collections also post to the shared customer receipt ledger, unallocated as dealer advances until allocated to a posted sales invoice. Configure `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET` in the backend environment and register `POST /api/tiles/dealer/payments/razorpay/webhook` for `payment.captured` and `payment.failed`. Credentials are not included in the repository and the migration is not applied automatically.
+
+Migration 047 adds Razorpay full-refund request and reconciliation metadata to dealer payment attempts. Admin can request an eligible refund and reconcile it against Razorpay's API; only a confirmed processed refund reverses the original receipt in the existing payment ledger. Apply with `npm run migrate`; the down migration removes only the refund metadata fields.
+
+Migration 048 extends dealer order snapshots with expected delivery and stock/payment-term confirmation fields, and adds an Admin-to-dealer activity message stream. Stock confirmation compares the current accepted quotation with store inventory and records a point-in-time result; it does not reserve or deduct stock. Admin processing requires both stock and payment-term confirmations. Dealer updates use in-app notifications.
+
+Migration 045 adds dealer checkout idempotency with request fingerprints, delivery contact/instruction snapshots, quotation document snapshots, and Admin/dealer order notification inbox rows. It does not create payment or accounting entries. Dealer UPI intents reuse the existing store invoice payment UPI ID; intent responses are not proof of payment.
+
+Migration 049 adds audited shipment and delivery records and links dealer orders to the existing sales invoice lifecycle.
+
+Migration 050 allows a linked dealer sales invoice to include only the transport charge accepted in its quotation when posted under Simple Non-GST billing. Other Non-GST invoices remain quantity-times-rate only, and taxes, discounts, and round-off remain blocked. Apply with `npm run migrate`.
+
+Migration 051 adds optional MRP per configured dealer product/unit price and an immutable per-item MRP snapshot. MRP is informational and is never used for order, tax, cart, or invoice totals. Existing rows remain without MRP. Apply with `npm run migrate`; rollback removes the MRP fields.
+
+Migration 053 seeds the provided business UPI ID only for stores without one, adds an opt-in store policy for partial dealer payments, and adds manual UPI payment claims. Claims remain unposted until an authorized Admin verifies the matching bank credit; verification then posts to the existing `payments` ledger and allocates to an already posted dealer invoice when present.
+
+Migration 054 sets future sales invoice number padding to four digits by default (minimum four) without changing issued invoice numbers or sequence history. The sales finalizer now formats annual counters using the April–March financial year and compact store codes. Apply with `npm run migrate`; rollback affects only the configured padding preference.
+
+Migration 056 stores per-store dealer transport options and snapshots the selected mode on new dealer orders. Existing orders retain their saved transport amounts and NULL mode until historical data identifies their mode. Apply with `npm run migrate`.
+
+Migration 057 adds Self Pickup (₹0) to existing per-store transport options without changing their other rates. It also allows explicit Admin collection confirmation without shipment details and requires full payment before a Self Pickup order is completed. Apply with `npm run migrate`.
+
+Migration 052 permits the Admin to confirm an unchanged, first-version dealer submission directly from `PENDING_REVIEW`, while retaining the historical quotation and acceptance transitions. It records the confirming user; it does not reserve stock, post payment, or create an invoice.
+
+Migration 063 enables scoped, audited financial revisions for eligible manual Non-GST Commercial sales invoices. It preserves issued document identity and item snapshots, records stock and bonus deltas, and releases excess receipt allocations as customer credit without deleting receipts. GST corrections, posted-return invoices, customer transfers, and Dealer Order commercial revisions remain gated by their respective correction or approval workflows. The migration supports multiple immutable partial releases from one payment allocation.
+
+Migration 064 makes posting a purchase invoice receive all of its invoice quantities automatically through the existing goods-receipt ledger. It also creates receipts for already-posted invoices that have no receipt records, while leaving invoices with any existing receipt history untouched. Apply with `npm run migrate`; the down migration removes the automatic behavior but retains receipt and stock history.

@@ -1,6 +1,7 @@
 import {createHash,randomUUID} from 'node:crypto';
 import {canAccessStore,canManageStore} from '../controllers/stores.js';
 import {hasPermission} from './permissions.js';
+import {allocateInvoiceNumber} from './invoiceNumbering.js';
 export const fail=(message,status=422)=>{throw Object.assign(new Error(message),{status});};
 export const idOk=x=>/^\d+$/.test(String(x??''));
 const decimal=(v,scale=4)=>new RegExp(`^\\d{1,14}(\\.\\d{1,${scale}})?$`).test(String(v??''));
@@ -17,8 +18,8 @@ export async function authorize(db,user,storeId,manage=false){
 export async function permissions(db,user,storeId){const manager=await canManageStore(user,storeId,['owner','manager'],db);return {canEdit:hasPermission(user,'returns.manage'),canFinalize:hasPermission(user,'returns.manage')&&manager,canOverrideRate:manager,canRefund:manager&&hasPermission(user,'payments.manage'),canInspect:manager&&hasPermission(user,'inventory.manage'),allowUnlinked:false};}
 export async function sourceInvoice(db,s,invoiceId){
  if(!idOk(invoiceId))fail('Store policy requires a posted original invoice. Unlinked returns are not authorized.',422);
- const r=await db.query(`SELECT i.*,i.invoice_date::text AS invoice_date,s.code AS store_code,p.name AS party_name,p.phone AS party_phone,p.tax_id AS party_tax_id,p.address AS party_address,p.is_active AS party_active
- FROM ${s.invoice} i JOIN stores s ON s.id=i.store_id LEFT JOIN ${s.party} p ON p.id=i.${s.partyKey} WHERE i.id=$1`,[invoiceId]);
+ const r=await db.query(`SELECT i.*,i.invoice_date::text AS invoice_date,s.code AS store_code,COALESCE(bc.invoice_prefix,s.code) AS invoice_prefix,s.invoice_numbering_period,s.invoice_number_padding,p.name AS party_name,p.phone AS party_phone,p.tax_id AS party_tax_id,p.address AS party_address,p.is_active AS party_active
+ FROM ${s.invoice} i JOIN stores s ON s.id=i.store_id LEFT JOIN store_billing_config bc ON bc.store_id=s.id LEFT JOIN ${s.party} p ON p.id=i.${s.partyKey} WHERE i.id=$1`,[invoiceId]);
  if(!r.rowCount)fail('Original invoice not found',404);if(r.rows[0].status!=='posted')fail('Returns require a posted original invoice');return r.rows[0];
 }
 // Item references, rather than a client-supplied invoice list, establish sources.
@@ -153,11 +154,11 @@ export async function distributeCredit(db,s,row,amount,user){
  for(const inv of balances){const values=(await db.query('SELECT LEAST($1::numeric,$2::numeric)::numeric(18,2) amount,GREATEST($1::numeric-$2::numeric,0)::numeric(18,2) remaining',[remaining,inv.due])).rows[0];if(Number(values.amount)>0){await db.query(`INSERT INTO return_credit_allocations(store_id,${s.returnKey},${s.invoiceKey},amount,created_by) VALUES($1,$2,$3,$4,$5)`,[row.store_id,row.id,inv.id,values.amount,user.id]);allocations.push({invoiceId:inv.id,amount:values.amount});}remaining=values.remaining;if(Number(remaining)===0)break;}
  return allocations;
 }
-export async function nextNumber(db,storeId,kind,series,date){const period=String(date).slice(0,4);await db.query('INSERT INTO invoice_number_sequences(store_id,document_type,series,period_key,next_number) VALUES($1,$2,$3,$4,1) ON CONFLICT DO NOTHING',[storeId,kind,series,period]);const r=await db.query('UPDATE invoice_number_sequences SET next_number=next_number+1 WHERE store_id=$1 AND document_type=$2 AND series=$3 AND period_key=$4 RETURNING next_number-1 AS number',[storeId,kind,series,period]);return `${series}-${period}-${String(r.rows[0].number).padStart(5,'0')}`;}
+export async function nextNumber(db,storeId,kind,series,date,policy='yearly',padding=4){return allocateInvoiceNumber(db,{storeId,documentType:kind,series,date,policy,padding});}
 export function documentSnapshot(inv,s){return {store:{name:inv.store_name_snapshot,address:inv.store_address_snapshot,phone:inv.store_phone_snapshot,email:inv.store_email_snapshot,gstin:inv.store_tax_id_snapshot,logo:inv.store_logo_snapshot},party:s.sales?{name:inv.customer_name_snapshot||inv.party_name,phone:inv.customer_mobile_snapshot||inv.party_phone,address:inv.customer_address_snapshot,gstin:inv.customer_tax_id_snapshot}:{...inv.supplier_details_snapshot,name:inv.supplier_details_snapshot?.name||inv.party_name},invoice:{id:inv.id,number:inv.invoice_number,date:inv.invoice_date,documentType:s.sales?inv.document_type:inv.supplier_document_type,invoiceType:inv.invoice_type,layout:inv.invoice_layout,total:inv.total},issuer:s.sales?'STORE':'INTERNAL_PURCHASE_RETURN'};}
 export async function writeDraft(db,s,data,user,id=null,key=null,hash=null){
  let rowId=id;
- if(!rowId){const series=`${s.sales?'SR':'PR'}${data.inv.store_code}`.slice(0,32);const number=await nextNumber(db,data.inv.store_id,`${s.kind}_return`,series,data.date);rowId=(await db.query(`INSERT INTO ${s.returns}(store_id,${s.invoiceKey},series,return_number,return_date,created_by,workflow_version,idempotency_key,request_fingerprint) VALUES($1,$2,$3,$4,$5,$6,2,$7,$8) RETURNING id`,[data.inv.store_id,data.inv.id,series,number,data.date,user.id,key,hash])).rows[0].id;}
+ if(!rowId){const series=`${data.inv.invoice_prefix||data.inv.store_code}-${s.sales?'C':'D'}`;const number=await nextNumber(db,data.inv.store_id,`${s.kind}_return`,series,data.date,data.inv.invoice_numbering_period,data.inv.invoice_number_padding);rowId=(await db.query(`INSERT INTO ${s.returns}(store_id,${s.invoiceKey},series,return_number,return_date,created_by,workflow_version,idempotency_key,request_fingerprint) VALUES($1,$2,$3,$4,$5,$6,2,$7,$8) RETURNING id`,[data.inv.store_id,data.inv.id,series,number,data.date,user.id,key,hash])).rows[0].id;}
  await db.query(`DELETE FROM ${s.items} WHERE ${s.returnKey}=$1`,[rowId]);
  for(const line of data.lines){
   const columns=s.sales?',product_condition,restock_quantity,quarantined_quantity,supplier_return_pending_quantity':',stock_bucket';

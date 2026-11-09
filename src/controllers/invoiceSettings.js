@@ -7,7 +7,7 @@ import {normalizeInvoicePaymentDetails} from '../services/invoicePaymentDetails.
 const hasStoredTaxId = settings => [settings.gstin, settings.tax_id].some(value => String(value ?? '').trim().length > 0);
 
 export async function readInvoiceSettings(db, id, lock = false) {
-  const r = await db.query(`SELECT s.id AS store_id,s.gstin,s.tax_id,s.terms_and_conditions,s.invoice_payment_details,
+  const r = await db.query(`SELECT s.id AS store_id,s.gstin,s.tax_id,s.terms_and_conditions,s.invoice_payment_details,s.dealer_partial_payments_enabled,
     COALESCE(c.invoice_type,'NON_GST') AS invoice_type, s.state,
     COALESCE(c.invoice_layout,'SIMPLE_LAYOUT') AS invoice_layout,
     COALESCE(c.default_document_type,'NON_GST_COMMERCIAL') AS default_document_type,
@@ -19,7 +19,7 @@ const output = (s, canEdit) => ({success:true,data:{storeId:s.store_id,invoiceTy
   billingMode:s.default_document_type==='NON_GST_COMMERCIAL'?'NON_GST':'GST',invoiceLayout:s.invoice_layout,defaultDocumentType:s.default_document_type,
   registrationCategory:s.gst_registration_category,state:s.state,gstin:s.gstin||s.tax_id||'',documentOptions:documentOptions(s),
   registrationStatus:s.gst_registration_status,hasStoredTaxId:hasStoredTaxId(s),canEdit,warning:documentWarning(s,s.default_document_type),
-  termsAndConditions:s.terms_and_conditions||'',paymentDetails:s.invoice_payment_details||{}}});
+  termsAndConditions:s.terms_and_conditions||'',paymentDetails:s.invoice_payment_details||{},dealerUpiEnabled:Boolean(s.invoice_payment_details?.upiId),manualVerificationEnabled:true,partialDealerPaymentsEnabled:Boolean(s.dealer_partial_payments_enabled)} });
 export async function getInvoiceSettings(req,res) {
   if (!/^\d+$/.test(req.params.id)) return res.status(400).json({message:"Invalid store ID"});
   try {
@@ -37,7 +37,8 @@ export async function putInvoiceSettings(req,res) {
     return res.status(400).json({message:"Invalid invoice type or registration status"});
   if((invoiceLayout!==undefined&&!INVOICE_LAYOUTS.includes(invoiceLayout)) || (defaultDocumentType!==undefined&&!DOCUMENT_TYPES.includes(defaultDocumentType)) ||
     (registrationCategory!==undefined&&!['UNKNOWN','REGULAR','COMPOSITION'].includes(registrationCategory)))return res.status(400).json({message:'Invalid layout, document type, or registration category'});
-  const {termsAndConditions,paymentDetails}=req.body||{};
+  const {termsAndConditions,paymentDetails,partialDealerPaymentsEnabled}=req.body||{};
+  if(partialDealerPaymentsEnabled!==undefined&&typeof partialDealerPaymentsEnabled!=='boolean')return res.status(400).json({message:'Partial dealer payments setting must be true or false'});
   let normalizedPayment;
   if(termsAndConditions!==undefined && (typeof termsAndConditions!=='string'||termsAndConditions.length>10000))return res.status(400).json({message:'Terms and conditions must be text of at most 10,000 characters.'});
   if(paymentDetails!==undefined)try{normalizedPayment=normalizeInvoicePaymentDetails(paymentDetails);}catch(e){return res.status(400).json({message:e.message});}
@@ -57,6 +58,7 @@ export async function putInvoiceSettings(req,res) {
       gst_registration_category:registrationCategory??previous.gst_registration_category};
     if(termsAndConditions!==undefined)next.terms_and_conditions=termsAndConditions.trim();
     if(normalizedPayment!==undefined)next.invoice_payment_details=normalizedPayment;
+    if(partialDealerPaymentsEnabled!==undefined)next.dealer_partial_payments_enabled=partialDealerPaymentsEnabled;
     const taxChanged=billingMode!==undefined || documentType!==previous.default_document_type || registrationStatus!==undefined || registrationCategory!==undefined || invoiceType!==undefined;
     const warning=taxChanged?documentWarning(next,documentType):null;
     if(warning){await c.query('ROLLBACK');return res.status(422).json({message:warning});}
@@ -68,6 +70,7 @@ export async function putInvoiceSettings(req,res) {
       await c.query('UPDATE store_billing_config SET terms_and_conditions=$2,updated_at=now() WHERE store_id=$1',[req.params.id,next.terms_and_conditions||null]);
     }
     if(normalizedPayment!==undefined)await c.query('UPDATE stores SET invoice_payment_details=$2,updated_at=now() WHERE id=$1',[req.params.id,normalizedPayment]);
+    if(partialDealerPaymentsEnabled!==undefined)await c.query('UPDATE stores SET dealer_partial_payments_enabled=$2,updated_at=now() WHERE id=$1',[req.params.id,partialDealerPaymentsEnabled]);
     await c.query("INSERT INTO invoice_settings_audit(store_id,changed_by,previous_settings,new_settings) VALUES($1,$2,$3,$4)",[req.params.id,req.user.id,previous,next]);
     await c.query("COMMIT");return res.json(output(next,true));
   } catch(e) {await c.query("ROLLBACK").catch(()=>{});console.error("Invoice settings",e.message);return res.status(500).json({message:"Unable to save invoice settings"});}

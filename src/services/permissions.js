@@ -1,4 +1,4 @@
-export const USER_TYPES=['Admin','Salesperson','Tile Mistire','Plumber Mistiri'];
+export const USER_TYPES=['Admin','Salesperson','Tile Mistire','Plumber Mistiri','Dealer'];
 export const PERMISSION_MODULES=[
   ['sales','Sales & billing',true],['purchases','Purchases & receiving',true],['payments','Payments',true],
   ['returns','Sales & purchase returns',true],['inventory','Inventory & adjustments',true],['transfers','Stock transfers',true],

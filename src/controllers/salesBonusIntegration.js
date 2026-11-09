@@ -65,7 +65,7 @@ export function applyRecipientRecoveryLedger(records) {
 export async function refreshInvoiceBonusPayability(client, invoiceId) {
   const invoiceResult=await client.query(`SELECT id,total,status FROM sales_invoices WHERE id=$1`,[invoiceId]);
   const invoice=invoiceResult.rows[0];if(!invoice)return;
-  const collected=await client.query(`SELECT COALESCE(sum(pa.amount),0)::numeric(18,2) amount FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.status='posted' WHERE pa.sales_invoice_id=$1 AND pa.direction='in'`,[invoiceId]);
+  const collected=await client.query(`SELECT COALESCE(sum(pa.amount-COALESCE(ar.amount,0)),0)::numeric(18,2) amount FROM payment_allocations pa JOIN payments p ON p.id=pa.payment_id AND p.status='posted' LEFT JOIN LATERAL(SELECT sum(amount) amount FROM payment_allocation_reversals WHERE allocation_id=pa.id) ar ON TRUE WHERE pa.sales_invoice_id=$1 AND pa.direction='in'`,[invoiceId]);
   const ratio=Number(invoice.total)>0?Math.min(Number(collected.rows[0].amount)/Number(invoice.total),1):0;
   const records=await client.query(`SELECT br.id,br.status,br.approved_by,br.approved_bonus,br.total_amount_paid,br.admin_payment_override,COALESCE(a.adjustments,0)::numeric(12,2) adjustments FROM sales_bonus_records br LEFT JOIN LATERAL(SELECT sum(amount) adjustments FROM sales_bonus_adjustments WHERE sales_bonus_record_id=br.id) a ON TRUE WHERE br.source_sales_invoice_id=$1 FOR UPDATE OF br`,[invoiceId]);
   for(const record of records.rows){

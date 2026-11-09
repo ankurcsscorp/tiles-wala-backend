@@ -9,6 +9,7 @@ export const USER_TYPES = [
   "Salesperson",
   "Tile Mistire",
   "Plumber Mistiri",
+  "Dealer",
 ];
 
 export const JWT_ISSUER = "tiles-wala-backend";
@@ -28,6 +29,13 @@ export const assertAuthConfiguration = () => {
     process.env.ADMIN_SIGNUP_KEY.length < 16
   ) {
     throw new Error("ADMIN_SIGNUP_KEY must be at least 16 characters.");
+  }
+
+  if (
+    process.env.DEALER_SIGNUP_CODE &&
+    process.env.DEALER_SIGNUP_CODE.length < 16
+  ) {
+    throw new Error("DEALER_SIGNUP_CODE must be at least 16 characters.");
   }
 };
 
@@ -123,7 +131,7 @@ export const signup = async (req, res) => {
   }
 
   if (
-    MISTIRI_USER_TYPES.has(userType) &&
+    (MISTIRI_USER_TYPES.has(userType) || userType === "Dealer") &&
     (!areaLocation || areaLocation.length > 200)
   ) {
     return res.status(400).json({
@@ -148,6 +156,17 @@ export const signup = async (req, res) => {
     }
   }
 
+  if (userType === "Dealer") {
+    if (!process.env.DEALER_SIGNUP_CODE) {
+      return res.status(503).json({
+        message: "Dealer signup is not configured",
+      });
+    }
+    if (!matchesAdminSignupKey(req.body.dealerCode, process.env.DEALER_SIGNUP_CODE)) {
+      return res.status(403).json({ message: "Invalid dealer code" });
+    }
+  }
+
   try {
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const result = await connection.query(
@@ -159,7 +178,7 @@ export const signup = async (req, res) => {
         mobile,
         passwordHash,
         userType,
-        MISTIRI_USER_TYPES.has(userType) ? areaLocation : null,
+        MISTIRI_USER_TYPES.has(userType) || userType === "Dealer" ? areaLocation : null,
       ]
     );
 

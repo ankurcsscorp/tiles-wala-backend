@@ -22,6 +22,7 @@ import { connection } from "./connection.js";
 import { assertAuthConfiguration } from "./src/controllers/auth.js";
 
 import gstRouter from "./src/routes/gst.js";
+import dealerPortalRouter from "./src/routes/dealerPortal.js";
 
 const app = express();
 
@@ -29,16 +30,20 @@ app.disable("x-powered-by");
 app.use(cors({
   origin: [
     "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
     "http://localhost:5173"
   ],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key"]
 }));
 app.use(
   "/api/tiles/collections",
   express.json({ limit: "12mb" }),
   collectionsRouter
 );
+app.use("/api/tiles/products", express.json({ limit: "12mb" }));
+app.use("/api/tiles/dealer-portal/orders", express.json({ limit: "1400kb" }));
 app.use(express.json({ limit: "20kb" }));
 
 app.use("/api/tiles", enquiriesRouter);
@@ -58,6 +63,8 @@ app.use("/api/tiles/transfers", transfersRouter);
 app.use("/api/tiles/returns", returnsRouter);
 app.use("/api/tiles/financial-reports", financialReportsRouter);
 app.use("/api/tiles/dashboard", dashboardRouter);
+app.use("/api/tiles/dealer-portal", dealerPortalRouter);
+app.use("/api/tiles/dealer", dealerPortalRouter);
 
 app.use((err, req, res, next) => {
   console.error("Unhandled request error:", err.message);
@@ -91,7 +98,7 @@ const startServer = async () => {
       password_hash TEXT NOT NULL,
       area_location VARCHAR(200),
       user_type VARCHAR(30) NOT NULL CHECK (
-        user_type IN ('Admin', 'Salesperson', 'Tile Mistire', 'Plumber Mistiri')
+        user_type IN ('Admin', 'Salesperson', 'Tile Mistire', 'Plumber Mistiri', 'Dealer')
       ),
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP

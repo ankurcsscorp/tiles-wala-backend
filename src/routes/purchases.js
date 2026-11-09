@@ -6,6 +6,7 @@ import {
   postPurchaseInvoice, cancelPurchase, reversePurchase, receivePurchaseGoods,
   purchaseReports, recordSupplierPayment,
   reverseGoodsReceipt,
+  deletePurchaseDraft, duplicatePurchaseDraft, purchaseRevisionHistory, downloadPurchasePdf, purchaseEditPreview, purchaseCancellationPreview,
 } from "../controllers/purchases.js";
 
 const router=express.Router();
@@ -15,6 +16,12 @@ router.post("/payments",requirePermission("payments","manage"),recordSupplierPay
 router.get("/",listPurchases);
 router.post("/",createPurchaseDraft);
 router.get("/:id/items",getPurchaseItems);
+router.get("/:id/revisions",purchaseRevisionHistory);
+router.get("/:id/pdf",downloadPurchasePdf);
+router.get("/:id/edit-preview",purchaseEditPreview);
+router.get("/:id/cancellation-preview",purchaseCancellationPreview);
+router.post("/:id/duplicate-draft",duplicatePurchaseDraft);
+router.delete("/:id/draft",deletePurchaseDraft);
 router.get("/:id",getPurchase);
 router.put("/:id",updatePurchaseDraft);
 router.post("/:id/post",postPurchaseInvoice);

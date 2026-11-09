@@ -22,6 +22,11 @@ test('store API uses billing configuration for invoice prefixes with the migrate
     }
     const management = await readFile(new URL('../migrations/004_store_management.sql', import.meta.url), 'utf8');
     await client.query(management.slice(0, management.indexOf('ALTER TABLE sales_invoices')));
+    await client.query('CREATE TEMP TABLE sales_invoices(store_id bigint,series varchar(32),status varchar(16),updated_at timestamptz) ON COMMIT DROP');
+    await client.query('CREATE TEMP TABLE purchase_invoices(store_id bigint,series varchar(32)) ON COMMIT DROP');
+    await client.query('CREATE TEMP TABLE sales_returns(store_id bigint,series varchar(32)) ON COMMIT DROP');
+    await client.query('CREATE TEMP TABLE purchase_returns(store_id bigint,series varchar(32)) ON COMMIT DROP');
+    await client.query('CREATE TEMP TABLE audit_logs(store_id bigint,user_id bigint,action varchar(100),entity_type varchar(80),entity_id bigint,before_data jsonb,after_data jsonb) ON COMMIT DROP');
     await client.query('CREATE TEMP TABLE user_store_assignments(user_id bigint, store_id bigint, is_active boolean) ON COMMIT DROP');
     connection.query = (...args) => client.query(...args);
     connection.connect = async () => ({
@@ -29,17 +34,17 @@ test('store API uses billing configuration for invoice prefixes with the migrate
       release() {},
     });
     const user = { id: '1', userType: 'Admin' };
-    const body = { code: 'tilesWala1', name: 'A & A Home Decor', legalName: 'A and A Home Decor', address: { line1: 'Madhaul Chowk', line2: '' }, city: 'Mahua', state: 'Bihar', pinCode: '844122', gstin: '10JNEPD0678B1ZL', invoicePrefix: '', invoiceNumberingPeriod: 'yearly', invoiceNumberPadding: 5 };
+    const body = { code: 'tilesWala1', name: 'A & A Home Decor', legalName: 'A and A Home Decor', address: { line1: 'Madhaul Chowk', line2: '' }, city: 'Mahua', state: 'Bihar', pinCode: '844122', gstin: '10JNEPD0678B1ZL', invoicePrefix: 'AA', invoiceNumberingPeriod: 'yearly', invoiceNumberPadding: 4 };
     const created = response();
     await createStore({ user, body }, created);
     assert.equal(created.statusCode, 201);
-    assert.equal(created.body.invoice_prefix, 'TILESWALA1');
+    assert.equal(created.body.invoice_prefix, 'AA');
     const id = String(created.body.id);
-    assert.equal((await client.query('SELECT invoice_prefix FROM store_billing_config WHERE store_id=$1', [id])).rows[0].invoice_prefix, 'TILESWALA1');
+    assert.equal((await client.query('SELECT invoice_prefix FROM store_billing_config WHERE store_id=$1', [id])).rows[0].invoice_prefix, 'AA');
     const updated = response();
-    await updateStore({ user, params: { id }, body: { ...body, invoicePrefix: 'AA', invoiceFooter: 'Thank you', invoiceNumberPadding: 6 } }, updated);
+      await updateStore({ user, params: { id }, body: { ...body, invoicePrefix: 'PT', invoiceFooter: 'Thank you', invoiceNumberPadding: 6 } }, updated);
     assert.equal(updated.statusCode, 200);
-    assert.equal(updated.body.invoice_prefix, 'AA');
+    assert.equal(updated.body.invoice_prefix, 'PT');
     assert.equal(updated.body.invoice_footer, 'Thank you');
     assert.equal(updated.body.invoice_number_padding, 6);
     const settings = response();

@@ -18,6 +18,8 @@ const productSelect = `p.id,p.sku,p.name,p.description,p.product_description,p.c
  p.purchase_unit_id,pu.code AS purchase_unit_code,pu.name AS purchase_unit_name,
  p.sales_unit_id,su.code AS sales_unit_code,su.name AS sales_unit_name,
  p.default_purchase_price,p.default_selling_price,p.reorder_threshold,p.is_active,p.created_at,p.updated_at`;
+const dealerPricesSelect = `p.available_for_dealer_ordering,COALESCE((SELECT jsonb_agg(jsonb_build_object('unitId',d.unit_id,'price',d.dealer_price,'mrp',d.mrp,'unitCode',u.code,'unitName',u.name) ORDER BY u.name)
+ FROM dealer_product_unit_prices d JOIN units_of_measure u ON u.id=d.unit_id WHERE d.product_id=p.id),'[]'::jsonb) AS dealer_prices`;
 
 function validateProduct(body = {}, {allowMissingSku = false} = {}) {
   const sku=text(body.sku).toUpperCase(); const name=text(body.name);
@@ -49,14 +51,23 @@ function validateProduct(body = {}, {allowMissingSku = false} = {}) {
     if(!/^\d{1,10}(\.\d{1,8})?$/.test(factor)||Number(factor)<=0) return {error:"Conversion factors must be positive decimals with up to 8 decimal places"};
     seen.add(String(unitId)); conversions.push({unitId:String(unitId),factor});
   }
+  let dealerPrices;
+  if(body.dealerPrices!==undefined){
+    if(!Array.isArray(body.dealerPrices)||body.dealerPrices.length>40)return {error:'Dealer prices must be a list of at most 40 product units'};
+    const dealerSeen=new Set();dealerPrices=[];
+    for(const row of body.dealerPrices){const unitId=positiveId(row?.unitId);if(!unitId||Number.isNaN(unitId))return {error:'Each dealer price needs a valid product unit'};if(dealerSeen.has(String(unitId)))return {error:'A dealer price may only be listed once per unit'};dealerSeen.add(String(unitId));const price=money(row?.price,'Dealer price');if(typeof price==='string'&&price.includes('must be'))return {error:price};const mrp=money(row?.mrp,'MRP');if(typeof mrp==='string'&&mrp.includes('must be'))return {error:mrp};if(mrp!==null&&!/^\d{1,10}(\.\d{1,2})?$/.test(mrp))return {error:'MRP must be a non-negative amount with up to 2 decimal places'};if(mrp!==null&&price===null)return {error:'Set a dealer price for a unit before configuring its MRP'};dealerPrices.push({unitId:String(unitId),price,mrp});}
+  }
+  if(body.availableForDealerOrdering!==undefined&&typeof body.availableForDealerOrdering!=='boolean')return {error:'Available for dealer ordering must be true or false'};
   if(purchaseUnitId&&String(purchaseUnitId)!==String(baseUnitId)&&!seen.has(String(purchaseUnitId))) return {error:"Add a conversion factor for the purchase unit"};
   if(salesUnitId&&String(salesUnitId)!==String(baseUnitId)&&!seen.has(String(salesUnitId))) return {error:"Add a conversion factor for the sales unit"};
   const image=text(body.productImageUrl);
-  if(image.length>2000) return {error:"Product image URL must be 2000 characters or fewer"};
+  if(!image) return {error:"A product image is required"};
+  if(image.length>10_000_000||(!/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(image)&&!/^https?:\/\//i.test(image))) return {error:"Upload a valid JPG, PNG, or WebP product image (maximum 7 MB)"};
   const fields={supplyClassification,classificationReference,sku,name,categoryId,baseUnitId,purchaseUnitId,salesUnitId,conversions,
     description:text(body.description),productDescription:text(body.productDescription),brand:text(body.brand),collection:text(body.collection),tileSize:text(body.tileSize),finish:text(body.finish),color:text(body.color),productImageUrl:image,
     hsnCode:text(body.hsnCode),taxRate,taxInclusive:typeof body.taxInclusive==="boolean"?body.taxInclusive:null,
-    defaultPurchasePrice:prices.purchase,defaultSellingPrice:prices.selling,reorderThreshold:prices.reorder,isActive:body.isActive!==false};
+    defaultPurchasePrice:prices.purchase,defaultSellingPrice:prices.selling,reorderThreshold:prices.reorder,isActive:body.isActive!==false,
+    dealerPrices,availableForDealerOrdering:body.availableForDealerOrdering};
   if(fields.description.length>2000||fields.productDescription.length>10000||fields.brand.length>120||fields.collection.length>160||fields.tileSize.length>80||fields.finish.length>80||fields.color.length>80||fields.hsnCode.length>16) return {error:"One or more product fields exceed the allowed length"};
   return {data:fields};
 }
@@ -89,7 +100,8 @@ export async function listProducts(req,res) {
     const offset=(page-1)*limit;const limitParam=bind(limit);const offsetParam=bind(offset);
     const storeExpr=storeId?`COALESCE((SELECT quantity FROM inventory_balances ib WHERE ib.product_id=p.id AND ib.store_id=${bind(storeId)}),0)`:"NULL";
     const businessExpr=businessWide?"COALESCE((SELECT sum(quantity) FROM inventory_balances ib WHERE ib.product_id=p.id),0)":"NULL";
-    const data=await connection.query(`SELECT ${productSelect},${storeExpr} AS store_stock,${businessExpr} AS business_stock ${listJoins} ${whereSql} ORDER BY ${sort} ${direction},p.id ASC LIMIT ${limitParam} OFFSET ${offsetParam}`,params);
+    const dealerFields=isAdmin(req)?dealerPricesSelect:`p.available_for_dealer_ordering,'[]'::jsonb AS dealer_prices`;
+    const data=await connection.query(`SELECT ${productSelect},${dealerFields},${storeExpr} AS store_stock,${businessExpr} AS business_stock ${listJoins} ${whereSql} ORDER BY ${sort} ${direction},p.id ASC LIMIT ${limitParam} OFFSET ${offsetParam}`,params);
     res.json({items:data.rows,pagination:{page,limit,total:count.rows[0].total,totalPages:Math.ceil(count.rows[0].total/limit)}});
   }catch(error){console.error("Unable to list products:",error.message);res.status(500).json({message:"Unable to load products"});}
 }
@@ -106,6 +118,12 @@ async function saveConversions(client,productId,conversions){
   await client.query("DELETE FROM product_unit_conversions WHERE product_id=$1",[productId]);
   for(const conversion of conversions) await client.query("INSERT INTO product_unit_conversions(product_id,unit_id,factor_to_base) VALUES($1,$2,$3)",[productId,conversion.unitId,conversion.factor]);
 }
+async function saveDealerPrices(client,productId,dealerPrices){
+  if(dealerPrices===undefined)return;
+  await client.query('DELETE FROM dealer_product_unit_prices WHERE product_id=$1',[productId]);
+  for(const row of dealerPrices)if(row.price!==null)await client.query('INSERT INTO dealer_product_unit_prices(product_id,unit_id,dealer_price,mrp) VALUES($1,$2,$3,$4)',[productId,row.unitId,row.price,row.mrp]);
+}
+function dealerPricingAllowed(req){return isAdmin(req)||(!Object.hasOwn(req.body||{},'dealerPrices')&&!Object.hasOwn(req.body||{},'availableForDealerOrdering'));}
 
 async function nextCategorySku(client,categoryId){
   if(!categoryId)throw Object.assign(new Error("Select a category to generate the product SKU"),{statusCode:400});
@@ -122,18 +140,21 @@ async function nextCategorySku(client,categoryId){
 }
 
 export async function createProduct(req,res){
+  if(!dealerPricingAllowed(req))return res.status(403).json({message:'Only Admin users can configure dealer pricing'});
   const {data,error}=validateProduct(req.body,{allowMissingSku:true});if(error)return res.status(400).json({message:error});
+  if(data.availableForDealerOrdering&&!(data.dealerPrices||[]).some(x=>x.price!==null))return res.status(400).json({message:'Add at least one dealer price before enabling dealer ordering'});
   const client=await connection.connect();
-  try{await client.query("BEGIN");if(!data.sku)data.sku=await nextCategorySku(client,data.categoryId);const result=await client.query(`INSERT INTO products(sku,name,description,product_description,category_id,brand,collection,tile_size,finish,color,product_image_url,hsn_code,tax_rate,tax_inclusive,base_unit_id,purchase_unit_id,sales_unit_id,default_purchase_price,default_selling_price,reorder_threshold,is_active,gst_supply_classification,gst_classification_reference)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING id`,[data.sku,data.name,data.description||null,data.productDescription||null,data.categoryId,data.brand||null,data.collection||null,data.tileSize||null,data.finish||null,data.color||null,data.productImageUrl||null,data.hsnCode||null,data.taxRate,data.taxInclusive,data.baseUnitId,data.purchaseUnitId,data.salesUnitId,data.defaultPurchasePrice,data.defaultSellingPrice,data.reorderThreshold,data.isActive,data.supplyClassification,data.classificationReference||null]);
-    await saveConversions(client,result.rows[0].id,data.conversions);await client.query("COMMIT");return getProduct({...req,params:{id:result.rows[0].id},query:{}},res);
+  try{await client.query("BEGIN");if(!data.sku)data.sku=await nextCategorySku(client,data.categoryId);const result=await client.query(`INSERT INTO products(sku,name,description,product_description,category_id,brand,collection,tile_size,finish,color,product_image_url,hsn_code,tax_rate,tax_inclusive,base_unit_id,purchase_unit_id,sales_unit_id,default_purchase_price,default_selling_price,reorder_threshold,is_active,gst_supply_classification,gst_classification_reference,available_for_dealer_ordering)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id`,[data.sku,data.name,data.description||null,data.productDescription||null,data.categoryId,data.brand||null,data.collection||null,data.tileSize||null,data.finish||null,data.color||null,data.productImageUrl||null,data.hsnCode||null,data.taxRate,data.taxInclusive,data.baseUnitId,data.purchaseUnitId,data.salesUnitId,data.defaultPurchasePrice,data.defaultSellingPrice,data.reorderThreshold,data.isActive,data.supplyClassification,data.classificationReference||null,data.availableForDealerOrdering??false]);
+    await saveConversions(client,result.rows[0].id,data.conversions);await saveDealerPrices(client,result.rows[0].id,data.dealerPrices);await client.query("COMMIT");return getProduct({...req,params:{id:result.rows[0].id},query:{}},res);
   }catch(error){await client.query("ROLLBACK").catch(()=>{});if(error.statusCode)return res.status(error.statusCode).json({message:error.message});if(error.code==="23505")return res.status(409).json({message:"A product with this SKU already exists"});if(error.code==="23503")return res.status(400).json({message:"Selected category or unit does not exist"});if(error.code==="23514")return res.status(400).json({message:error.message});console.error("Unable to create product:",error.message);res.status(500).json({message:"Unable to create product"});}finally{client.release();}
 }
 
 export async function updateProduct(req,res){
+  if(!dealerPricingAllowed(req))return res.status(403).json({message:'Only Admin users can configure dealer pricing'});
   if(!idOk(req.params.id))return res.status(400).json({message:"Invalid product ID"});const {data,error}=validateProduct(req.body);if(error)return res.status(400).json({message:error});const client=await connection.connect();
-  try{await client.query("BEGIN");const result=await client.query(`UPDATE products SET sku=$2,name=$3,description=$4,product_description=$5,category_id=$6,brand=$7,collection=$8,tile_size=$9,finish=$10,color=$11,product_image_url=$12,hsn_code=$13,tax_rate=$14,tax_inclusive=$15,base_unit_id=$16,purchase_unit_id=$17,sales_unit_id=$18,default_purchase_price=$19,default_selling_price=$20,reorder_threshold=$21,is_active=$22,gst_supply_classification=COALESCE($23,gst_supply_classification),gst_classification_reference=CASE WHEN $23 IS NULL THEN gst_classification_reference ELSE $24 END,updated_at=now() WHERE id=$1 RETURNING id`,[req.params.id,data.sku,data.name,data.description||null,data.productDescription||null,data.categoryId,data.brand||null,data.collection||null,data.tileSize||null,data.finish||null,data.color||null,data.productImageUrl||null,data.hsnCode||null,data.taxRate,data.taxInclusive,data.baseUnitId,data.purchaseUnitId,data.salesUnitId,data.defaultPurchasePrice,data.defaultSellingPrice,data.reorderThreshold,data.isActive,req.body.supplyClassification===undefined?null:data.supplyClassification,data.classificationReference||null]);
-    if(!result.rowCount){await client.query("ROLLBACK");return res.status(404).json({message:"Product not found"});}await saveConversions(client,req.params.id,data.conversions);await client.query("COMMIT");return getProduct({...req,params:{id:req.params.id},query:{}},res);
+  try{await client.query("BEGIN");const result=await client.query(`UPDATE products SET sku=$2,name=$3,description=$4,product_description=$5,category_id=$6,brand=$7,collection=$8,tile_size=$9,finish=$10,color=$11,product_image_url=$12,hsn_code=$13,tax_rate=$14,tax_inclusive=$15,base_unit_id=$16,purchase_unit_id=$17,sales_unit_id=$18,default_purchase_price=$19,default_selling_price=$20,reorder_threshold=$21,is_active=$22,gst_supply_classification=COALESCE($23,gst_supply_classification),gst_classification_reference=CASE WHEN $23 IS NULL THEN gst_classification_reference ELSE $24 END,available_for_dealer_ordering=COALESCE($25,available_for_dealer_ordering),updated_at=now() WHERE id=$1 RETURNING id`,[req.params.id,data.sku,data.name,data.description||null,data.productDescription||null,data.categoryId,data.brand||null,data.collection||null,data.tileSize||null,data.finish||null,data.color||null,data.productImageUrl||null,data.hsnCode||null,data.taxRate,data.taxInclusive,data.baseUnitId,data.purchaseUnitId,data.salesUnitId,data.defaultPurchasePrice,data.defaultSellingPrice,data.reorderThreshold,data.isActive,req.body.supplyClassification===undefined?null:data.supplyClassification,data.classificationReference||null,data.availableForDealerOrdering??null]);
+    if(!result.rowCount){await client.query("ROLLBACK");return res.status(404).json({message:"Product not found"});}await saveConversions(client,req.params.id,data.conversions);await saveDealerPrices(client,req.params.id,data.dealerPrices);const enabled=(await client.query('SELECT available_for_dealer_ordering FROM products WHERE id=$1',[req.params.id])).rows[0].available_for_dealer_ordering;const priced=(await client.query('SELECT EXISTS(SELECT 1 FROM dealer_product_unit_prices WHERE product_id=$1) AS value',[req.params.id])).rows[0].value;if(enabled&&!priced){await client.query('ROLLBACK');return res.status(400).json({message:'Add at least one dealer price before enabling dealer ordering'});}await client.query("COMMIT");return getProduct({...req,params:{id:req.params.id},query:{}},res);
   }catch(error){await client.query("ROLLBACK").catch(()=>{});if(error.code==="23505")return res.status(409).json({message:"A product with this SKU already exists"});if(error.code==="23503")return res.status(400).json({message:"Selected category or unit does not exist"});if(error.code==="23514")return res.status(400).json({message:error.message});console.error("Unable to update product:",error.message);res.status(500).json({message:"Unable to update product"});}finally{client.release();}
 }
 
