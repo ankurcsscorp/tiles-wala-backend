@@ -120,7 +120,6 @@ export async function listCustomers(req, res) {
 
 export async function searchCustomers(req, res) {
   const q = clean(req.query.q);
-  if (q.length < 2) return res.json([]);
   try {
     if (!(await authorizedStoreIds(req)).length && !isAdmin(req)) return res.json([]);
     const result = await connection.query(`SELECT ${customerFields} FROM customers WHERE is_active=TRUE AND

@@ -84,7 +84,7 @@ export async function listProducts(req,res) {
   const params=[]; const where=[]; const bind=(v)=>{params.push(v);return `$${params.length}`;};
   if(req.params?.id) where.push(`p.id=${bind(req.params.id)}`);
   const q=text(req.query.q).toLowerCase();
-  if(q){const p=bind(`${q}%`);where.push(`(lower(p.sku) LIKE ${p} OR lower(p.name) LIKE ${p} OR lower(COALESCE(p.brand,'')) LIKE ${p} OR lower(COALESCE(p.collection,'')) LIKE ${p} OR lower(COALESCE(pc.name,'')) LIKE ${p} OR lower(COALESCE(p.tile_size,'')) LIKE ${p} OR lower(COALESCE(p.finish,'')) LIKE ${p})`);}
+  if(q){const p=bind(`%${q}%`);where.push(`(lower(p.sku) LIKE ${p} OR lower(p.name) LIKE ${p} OR lower(COALESCE(p.hsn_code,'')) LIKE ${p} OR lower(COALESCE(p.brand,'')) LIKE ${p} OR lower(COALESCE(p.collection,'')) LIKE ${p} OR lower(COALESCE(pc.name,'')) LIKE ${p} OR lower(COALESCE(p.tile_size,'')) LIKE ${p} OR lower(COALESCE(p.finish,'')) LIKE ${p})`);}
   for(const [key,expression] of [["categoryId","p.category_id"],["brand","p.brand"],["collection","p.collection"],["tileSize","p.tile_size"],["finish","p.finish"]]) {
     const value=text(req.query[key]); if(value){const p=bind(key==="categoryId"?value:`${value}%`);where.push(key==="categoryId"?`${expression}=${p}`:`lower(${expression}) LIKE lower(${p})`);}
   }

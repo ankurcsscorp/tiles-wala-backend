@@ -98,7 +98,7 @@ async function finalize(req,res,modern){return transaction(req,res,'Unable to fi
  await workflow.lockReturnInventory(c,row.store_id,lines);
  const before=await partyBalance(c,s,row.store_id,row.party_id);
  const expected=(await c.query('SELECT LEAST($1::numeric,GREATEST($2::numeric,0))::numeric(18,2) adjusted,($1::numeric-$3::numeric)::numeric(18,2) credit',[row.total,before,row.refund_amount])).rows[0];
- const adjusted=row.settlement_mode==='CREDIT'?'0.00':expected.adjusted;
+ const adjusted=row.settlement_mode==='CREDIT'||row.settlement_mode==='REFUND'?'0.00':expected.adjusted;
  if(!(await c.query('SELECT $1::numeric+$2::numeric<=$3::numeric AS ok',[adjusted,row.refund_amount,row.total])).rows[0].ok)fail('Refund exceeds credit available after outstanding adjustment; edit the unapproved draft',409);
  if(Number(row.refund_amount)>0){if(!hasPermission(req.user,'payments.manage'))fail('Payment-management permission is required for refunds',403);if(!(await c.query('SELECT 1 FROM payment_method_options WHERE code=$1 AND is_active=TRUE',[row.refund_method])).rowCount)fail('The selected refund payment method is no longer active');}
  let allocations=[];

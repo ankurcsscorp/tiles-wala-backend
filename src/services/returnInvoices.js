@@ -144,7 +144,7 @@ export async function calculate(db,s,b,user,{excludeReturnId=null}={}){
  if(b.supplierCreditNoteReference&&!b.supplierCreditNoteDate)fail('Enter the date shown on the supplier credit note');
  const outstanding=await partyBalance(db,s,inv.store_id,inv[s.partyKey]);
  const settlement=(await db.query('SELECT LEAST($1::numeric, GREATEST($2::numeric,0))::numeric(18,2) AS adjusted,($1::numeric-$3::numeric)::numeric(18,2) AS net',[amounts.total,outstanding,refund])).rows[0];
- const adjusted=mode==='CREDIT'?'0.00':settlement.adjusted;
+ const adjusted=mode==='CREDIT'||mode==='REFUND'?'0.00':settlement.adjusted;
  if(!(await db.query('SELECT $1::numeric+$2::numeric<=$3::numeric AS ok',[adjusted,refund,amounts.total])).rows[0].ok)fail('Refund exceeds the credit available after adjusting outstanding invoices');
  const credit=(await db.query('SELECT ($1::numeric-$2::numeric)::numeric(18,2) AS value',[settlement.net,adjusted])).rows[0].value;
  return {inv,invoices,lines,date,reason,notes,amounts,mode,refund,refundMethod:Number(refund)>0?b.refundMethod:null,refundReference:String(b.refundReference||'').slice(0,120),refundDate,outstanding,adjusted,credit,netCredit:settlement.net,access,supplierNote:String(b.supplierCreditNoteReference||'').slice(0,120),supplierNoteDate:b.supplierCreditNoteDate||null};

@@ -117,7 +117,7 @@ export async function listSuppliers(req,res) {
 }
 
 export async function searchSuppliers(req,res) {
-  const q=clean(req.query.q);if(q.length<2)return res.json([]);
+  const q=clean(req.query.q);
   try{if(!(await authorizedStoreIds(req)).length&&!isAdmin(req))return res.json([]);const result=await connection.query(`SELECT ${supplierFields} FROM suppliers WHERE is_active=TRUE AND (name ILIKE $1 OR COALESCE(code,'') ILIKE $1 OR COALESCE(phone,'') ILIKE $1 OR COALESCE(contact_person,'') ILIKE $1) ORDER BY CASE WHEN phone ILIKE $2 THEN 0 ELSE 1 END,name LIMIT 15`,[`%${q}%`,`${q}%`]);res.json(result.rows);}
   catch(error){console.error("Unable to search suppliers:",error.message);res.status(500).json({message:"Unable to search suppliers"});}
 }
